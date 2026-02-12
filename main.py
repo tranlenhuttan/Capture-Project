@@ -16,15 +16,27 @@ templates = Jinja2Templates(directory="templates")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
+
 def safe_path(user_path: str) -> Path:
-    resolved = (UPLOAD_DIR / user_path).resolve()
+    cleaned = user_path.strip("/").strip()
+
+    if not cleaned:
+        return UPLOAD_DIR.resolve()
+
+    resolved = (UPLOAD_DIR / cleaned).resolve()
+
     if not str(resolved).startswith(str(UPLOAD_DIR.resolve())):
         raise HTTPException(status_code=403, detail="Access denied")
+
     return resolved
+
 
 def format_size(size_bytes: int) -> str:
     for unit in ["B", "KB", "MB", "GB", "TB"]:
@@ -33,6 +45,7 @@ def format_size(size_bytes: int) -> str:
                 return f"{size_bytes} {unit}"
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024
+
 
 def get_file_info(filepath: Path) -> dict:
     stat = filepath.stat()
@@ -52,15 +65,20 @@ def get_file_info(filepath: Path) -> dict:
             file_type = "audio"
         elif mime_type == "application/pdf":
             file_type = "pdf"
-        elif filepath.suffix.lower() in [".py", ".js", ".html", ".css", ".json", ".md"]:
+        elif filepath.suffix.lower() in [
+            ".py", ".js", ".html", ".css", ".json", ".md",
+            ".ts", ".tsx", ".jsx", ".vue", ".sql", ".xml",
+            ".yml", ".yaml", ".sh", ".bat", ".csv", ".log",
+            ".ini", ".env", ".txt",
+        ]:
             file_type = "code"
         else:
             file_type = "file"
 
     if filepath.is_dir():
         size = 0
-        for f in filepath.rglob("*"):   
-            if f.is_file():             
+        for f in filepath.rglob("*"):
+            if f.is_file():
                 size += f.stat().st_size
     else:
         size = stat.st_size
@@ -70,6 +88,7 @@ def get_file_info(filepath: Path) -> dict:
     return {
         "name": filepath.name,
         "path": str(filepath.relative_to(UPLOAD_DIR)),
+        "type": "folder" if filepath.is_dir() else "file",
         "is_dir": filepath.is_dir(),
         "size": size,
         "size_display": format_size(size),
@@ -78,45 +97,38 @@ def get_file_info(filepath: Path) -> dict:
         "modified": modified_dt.isoformat(),
         "modified_display": modified_dt.strftime("%b %d, %Y %I:%M %p"),
     }
+
+
 @app.get("/api/files")
 async def list_files(path: str = ""):
     target = safe_path(path)
+
     if not target.exists():
         raise HTTPException(status_code=404, detail="Directory not found")
     if not target.is_dir():
         raise HTTPException(status_code=400, detail="Not a directory")
+
     items = []
     for item in target.iterdir():
         if item.name.startswith("."):
             continue
         items.append(get_file_info(item))
 
-    def sort_key(item):
-        is_file = not item["is_dir"]
-        name = item["name"].lower()
-        return (is_file, name)
-
-    items.sort(key=sort_key)
+    items.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
 
     breadcrumb = []
     if path:
         parts = Path(path).parts
         for i, part in enumerate(parts):
-            full_path = str(Path(*parts[:i + 1]))
+            full_path = str(Path(*parts[: i + 1]))
             breadcrumb.append({"name": part, "path": full_path})
 
-    total_size = 0
-    for f in UPLOAD_DIR.rglob("*"):
-        if f.is_file():
-            total_size += f.stat().st_size
+    total_size = sum(
+        f.stat().st_size for f in UPLOAD_DIR.rglob("*") if f.is_file()
+    )
 
-    total_files = 0
-    total_folders = 0
-    for item in items:
-        if item["is_dir"]:
-            total_folders += 1
-        else:
-            total_files += 1
+    total_files = sum(1 for x in items if not x["is_dir"])
+    total_folders = sum(1 for x in items if x["is_dir"])
 
     return {
         "items": items,
@@ -124,13 +136,17 @@ async def list_files(path: str = ""):
         "breadcrumb": breadcrumb,
         "total_files": total_files,
         "total_folders": total_folders,
-        "storage_used": format_size(total_size),
-        "storage_used_bytes": total_size,
+        "storage": {
+            "used": total_size,
+            "total": 15 * 1024 * 1024 * 1024,
+        },
     }
+
+
 @app.post("/api/upload")
 async def upload_files(
     files: list[UploadFile] = File(...),
-    path: str = Form("")
+    path: str = Form(""),
 ):
     target_dir = safe_path(path)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -155,21 +171,25 @@ async def upload_files(
 
         uploaded.append(get_file_info(filepath))
 
-    return {
-        "uploaded": uploaded,
-        "count": len(uploaded)
-    }
+    return {"uploaded": uploaded, "count": len(uploaded)}
+
+
 @app.post("/api/folder")
 async def create_folder(data: dict):
     name = data.get("name", "").strip()
-    parent = data.get("path", "")
+    parent = data.get("path", "").strip()
 
     if not name:
         raise HTTPException(status_code=400, detail="Folder name is required")
 
     name = name.replace("/", "_").replace("\\", "_")
 
-    target = safe_path(parent + "/" + name)
+    if parent:
+        full_path = parent.strip("/") + "/" + name
+    else:
+        full_path = name
+
+    target = safe_path(full_path)
 
     if target.exists():
         raise HTTPException(status_code=409, detail="Folder already exists")
@@ -178,8 +198,10 @@ async def create_folder(data: dict):
 
     return {
         "message": f"Folder '{name}' created",
-        "folder": get_file_info(target)
+        "folder": get_file_info(target),
     }
+
+
 @app.get("/api/download/{path:path}")
 async def download_file(path: str):
     filepath = safe_path(path)
@@ -193,10 +215,12 @@ async def download_file(path: str):
         return FileResponse(
             f"{zip_path}.zip",
             filename=f"{filepath.name}.zip",
-            media_type="application/zip"
+            media_type="application/zip",
         )
 
     return FileResponse(filepath, filename=filepath.name)
+
+
 @app.get("/api/preview/{path:path}")
 async def preview_file(path: str):
     filepath = safe_path(path)
@@ -210,7 +234,7 @@ async def preview_file(path: str):
     text_extensions = [
         ".txt", ".py", ".js", ".html", ".css", ".json", ".md",
         ".yml", ".yaml", ".sh", ".bat", ".tsx", ".jsx", ".ts",
-        ".vue", ".sql", ".xml", ".csv", ".log", ".ini", ".env"
+        ".vue", ".sql", ".xml", ".csv", ".log", ".ini", ".env",
     ]
 
     if filepath.suffix.lower() in text_extensions:
@@ -218,9 +242,30 @@ async def preview_file(path: str):
         return {"type": "text", "content": content}
 
     return FileResponse(filepath, media_type=mime_type)
+
+
 @app.delete("/api/files/{path:path}")
-async def delete_file(path: str):
+async def delete_file_by_path(path: str):
     filepath = safe_path(path)
+
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if filepath.is_dir():
+        shutil.rmtree(filepath)
+    else:
+        filepath.unlink()
+
+    return {"message": f"'{filepath.name}' deleted"}
+
+
+@app.delete("/api/delete")
+async def delete_file_by_body(data: dict):
+    file_path = data.get("path", "")
+    if not file_path:
+        raise HTTPException(status_code=400, detail="Path is required")
+
+    filepath = safe_path(file_path)
 
     if not filepath.exists():
         raise HTTPException(status_code=404, detail="Not found")
@@ -235,7 +280,7 @@ async def delete_file(path: str):
 
 @app.put("/api/rename")
 async def rename_file(data: dict):
-    old_path = data.get("old_path", "")
+    old_path = data.get("old_path") or data.get("path", "")
     new_name = data.get("new_name", "").strip()
 
     if not new_name:
@@ -254,7 +299,10 @@ async def rename_file(data: dict):
 
     source.rename(destination)
 
-    return {"message": f"Renamed to '{new_name}'", "file": get_file_info(destination)}
+    return {
+        "message": f"Renamed to '{new_name}'",
+        "file": get_file_info(destination),
+    }
 
 
 @app.post("/api/move")
@@ -297,6 +345,7 @@ async def search_files(q: str = "", path: str = ""):
                 break
 
     return {"results": results, "query": q}
+
 
 if __name__ == "__main__":
     import uvicorn
