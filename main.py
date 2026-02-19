@@ -1,106 +1,166 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi import UploadFile, File, Form
 from pathlib import Path
 from datetime import datetime
 import mimetypes
-from fastapi import UploadFile, File, Form
-from fastapi.responses import FileResponse
 import shutil
 
-app = FastAPI()
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+
+from database import get_db, init_db
+from models import FileItem
+
+# ═══════════════════════════════════════
+#   APP SETUP
+# ═══════════════════════════════════════
+
+app = FastAPI(title="Capture Project")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR = Path("uploads").resolve()
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
+
+@app.on_event("startup")
+def startup():
+    init_db()
+    print("✅ Database initialized")
+
+
+# ═══════════════════════════════════════
+#   HELPERS
+# ═══════════════════════════════════════
+
+def safe_path(user_path: str) -> Path:
+    cleaned = user_path.strip("/").strip()
+    if not cleaned:
+        return UPLOAD_DIR.resolve()
+    resolved = (UPLOAD_DIR / cleaned).resolve()
+    if not str(resolved).startswith(str(UPLOAD_DIR.resolve())):
+        raise HTTPException(status_code=403, detail="Access denied")
+    return resolved
+
+
+def detect_file_type(filepath: Path) -> tuple[str, str]:
+    if filepath.is_dir():
+        return "folder", "folder"
+
+    mime_type, _ = mimetypes.guess_type(filepath.name)
+    mime_type = mime_type or "application/octet-stream"
+
+    if mime_type.startswith("image/"):
+        return "image", mime_type
+    elif mime_type.startswith("video/"):
+        return "video", mime_type
+    elif mime_type.startswith("audio/"):
+        return "audio", mime_type
+    elif mime_type == "application/pdf":
+        return "pdf", mime_type
+    elif filepath.suffix.lower() in [
+        ".py", ".js", ".html", ".css", ".json", ".md",
+        ".ts", ".tsx", ".jsx", ".vue", ".sql", ".xml",
+        ".yml", ".yaml", ".sh", ".bat", ".csv", ".log",
+        ".ini", ".env", ".txt",
+    ]:
+        return "code", mime_type
+
+    return "file", mime_type
+
+
+def sync_file_to_db(filepath: Path, db: Session) -> FileItem:
+    """Upsert 1 file/folder từ disk vào database."""
+    rel_path = str(filepath.relative_to(UPLOAD_DIR)).replace("\\", "/")
+    parent = filepath.parent
+    if parent == UPLOAD_DIR:
+        parent_path = ""
+    else:
+        parent_path = str(parent.relative_to(UPLOAD_DIR)).replace("\\", "/")
+    if parent_path == ".":
+        parent_path = ""
+
+    file_type, mime_type = detect_file_type(filepath)
+    stat = filepath.stat()
+    size = 0 if filepath.is_dir() else stat.st_size
+
+    item = db.query(FileItem).filter(FileItem.path == rel_path).first()
+
+    if item:
+        item.name        = filepath.name
+        item.parent_path = parent_path
+        item.size        = size
+        item.file_type   = file_type
+        item.mime_type   = mime_type
+        item.updated_at  = datetime.fromtimestamp(stat.st_mtime)
+    else:
+        item = FileItem(
+            name        = filepath.name,
+            path        = rel_path,
+            parent_path = parent_path,
+            is_dir      = filepath.is_dir(),
+            size        = size,
+            file_type   = file_type,
+            mime_type   = mime_type,
+            created_at  = datetime.fromtimestamp(stat.st_ctime),
+            updated_at  = datetime.fromtimestamp(stat.st_mtime),
+        )
+        db.add(item)
+
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def sync_directory_to_db(dir_path: Path, db: Session):
+    """Đồng bộ level-1 của thư mục với database."""
+    if not dir_path.exists() or not dir_path.is_dir():
+        return
+
+    rel_parent = "" if dir_path == UPLOAD_DIR else str(
+        dir_path.relative_to(UPLOAD_DIR)
+    ).replace("\\", "/")
+    if rel_parent == ".":
+        rel_parent = ""
+
+    disk_paths = set()
+    for item in dir_path.iterdir():
+        if item.name.startswith("."):
+            continue
+        disk_paths.add(str(item.relative_to(UPLOAD_DIR)).replace("\\", "/"))
+        sync_file_to_db(item, db)
+
+    # Xóa records không còn trên disk
+    db_items = db.query(FileItem).filter(
+        FileItem.parent_path == rel_parent,
+    ).all()
+    for db_item in db_items:
+        if db_item.path not in disk_paths:
+            db.delete(db_item)
+
+    db.commit()
+
+
+# ═══════════════════════════════════════
+#   ROUTES — Pages
+# ═══════════════════════════════════════
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 
-def safe_path(user_path: str) -> Path:
-    cleaned = user_path.strip("/").strip()
-
-    if not cleaned:
-        return UPLOAD_DIR.resolve()
-
-    resolved = (UPLOAD_DIR / cleaned).resolve()
-
-    if not str(resolved).startswith(str(UPLOAD_DIR.resolve())):
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    return resolved
-
-
-def format_size(size_bytes: int) -> str:
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size_bytes < 1024:
-            if unit == "B":
-                return f"{size_bytes} {unit}"
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024
-
-
-def get_file_info(filepath: Path) -> dict:
-    stat = filepath.stat()
-
-    if filepath.is_dir():
-        file_type = "folder"
-        mime_type = "folder"
-    else:
-        mime_type, _ = mimetypes.guess_type(filepath.name)
-        mime_type = mime_type or "application/octet-stream"
-
-        if mime_type.startswith("image/"):
-            file_type = "image"
-        elif mime_type.startswith("video/"):
-            file_type = "video"
-        elif mime_type.startswith("audio/"):
-            file_type = "audio"
-        elif mime_type == "application/pdf":
-            file_type = "pdf"
-        elif filepath.suffix.lower() in [
-            ".py", ".js", ".html", ".css", ".json", ".md",
-            ".ts", ".tsx", ".jsx", ".vue", ".sql", ".xml",
-            ".yml", ".yaml", ".sh", ".bat", ".csv", ".log",
-            ".ini", ".env", ".txt",
-        ]:
-            file_type = "code"
-        else:
-            file_type = "file"
-
-    if filepath.is_dir():
-        size = 0
-        for f in filepath.rglob("*"):
-            if f.is_file():
-                size += f.stat().st_size
-    else:
-        size = stat.st_size
-
-    modified_dt = datetime.fromtimestamp(stat.st_mtime)
-
-    return {
-        "name": filepath.name,
-        "path": str(filepath.relative_to(UPLOAD_DIR)),
-        "type": "folder" if filepath.is_dir() else "file",
-        "is_dir": filepath.is_dir(),
-        "size": size,
-        "size_display": format_size(size),
-        "file_type": file_type,
-        "mime_type": mime_type,
-        "modified": modified_dt.isoformat(),
-        "modified_display": modified_dt.strftime("%b %d, %Y %I:%M %p"),
-    }
-
+# ═══════════════════════════════════════
+#   API — List Files
+# ═══════════════════════════════════════
 
 @app.get("/api/files")
-async def list_files(path: str = ""):
+async def list_files(path: str = "", db: Session = Depends(get_db)):
     target = safe_path(path)
 
     if not target.exists():
@@ -108,112 +168,122 @@ async def list_files(path: str = ""):
     if not target.is_dir():
         raise HTTPException(status_code=400, detail="Not a directory")
 
-    items = []
-    for item in target.iterdir():
-        if item.name.startswith("."):
-            continue
-        items.append(get_file_info(item))
+    sync_directory_to_db(target, db)
 
-    items.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+    rel_parent = path.strip("/") if path else ""
+    items = (
+        db.query(FileItem)
+        .filter(FileItem.parent_path == rel_parent)
+        .order_by(FileItem.is_dir.desc(), FileItem.name)
+        .all()
+    )
 
+    # Breadcrumb
     breadcrumb = []
     if path:
         parts = Path(path).parts
         for i, part in enumerate(parts):
-            full_path = str(Path(*parts[: i + 1]))
-            breadcrumb.append({"name": part, "path": full_path})
+            breadcrumb.append({
+                "name": part,
+                "path": str(Path(*parts[: i + 1])),
+            })
 
-    total_size = sum(
-        f.stat().st_size for f in UPLOAD_DIR.rglob("*") if f.is_file()
+    # Storage
+    total_size = (
+        db.query(func.sum(FileItem.size))
+        .filter(FileItem.is_dir == False)
+        .scalar()
+        or 0
     )
 
-    total_files = sum(1 for x in items if not x["is_dir"])
-    total_folders = sum(1 for x in items if x["is_dir"])
-
     return {
-        "items": items,
+        "items":        [item.to_dict() for item in items],
         "current_path": path,
-        "breadcrumb": breadcrumb,
-        "total_files": total_files,
-        "total_folders": total_folders,
+        "breadcrumb":   breadcrumb,
+        "total_files":  sum(1 for x in items if not x.is_dir),
+        "total_folders":sum(1 for x in items if x.is_dir),
         "storage": {
-            "used": total_size,
+            "used":  total_size,
             "total": 15 * 1024 * 1024 * 1024,
         },
     }
 
 
+# ═══════════════════════════════════════
+#   API — Upload
+# ═══════════════════════════════════════
+
 @app.post("/api/upload")
 async def upload_files(
     files: list[UploadFile] = File(...),
     path: str = Form(""),
+    db: Session = Depends(get_db),
 ):
     target_dir = safe_path(path)
     target_dir.mkdir(parents=True, exist_ok=True)
 
     uploaded = []
-
     for file in files:
         filename = file.filename.replace("/", "_").replace("\\", "_")
         filepath = target_dir / filename
 
+        # Xử lý trùng tên
         if filepath.exists():
-            stem = filepath.stem
-            suffix = filepath.suffix
+            stem, suffix = filepath.stem, filepath.suffix
             counter = 1
             while filepath.exists():
                 filepath = target_dir / f"{stem} ({counter}){suffix}"
                 counter += 1
 
         content = await file.read()
-        with open(filepath, "wb") as f:
-            f.write(content)
+        filepath.write_bytes(content)
 
-        uploaded.append(get_file_info(filepath))
+        item = sync_file_to_db(filepath, db)
+        uploaded.append(item.to_dict())
 
     return {"uploaded": uploaded, "count": len(uploaded)}
 
 
+# ═══════════════════════════════════════
+#   API — Create Folder
+# ═══════════════════════════════════════
+
 @app.post("/api/folder")
-async def create_folder(data: dict):
-    name = data.get("name", "").strip()
+async def create_folder(data: dict, db: Session = Depends(get_db)):
+    name   = data.get("name", "").strip()
     parent = data.get("path", "").strip()
 
     if not name:
         raise HTTPException(status_code=400, detail="Folder name is required")
 
-    name = name.replace("/", "_").replace("\\", "_")
-
-    if parent:
-        full_path = parent.strip("/") + "/" + name
-    else:
-        full_path = name
-
-    target = safe_path(full_path)
+    name      = name.replace("/", "_").replace("\\", "_")
+    full_path = f"{parent.strip('/')}/{name}" if parent else name
+    target    = safe_path(full_path)
 
     if target.exists():
         raise HTTPException(status_code=409, detail="Folder already exists")
 
     target.mkdir(parents=True, exist_ok=True)
+    item = sync_file_to_db(target, db)
 
-    return {
-        "message": f"Folder '{name}' created",
-        "folder": get_file_info(target),
-    }
+    return {"message": f"Folder '{name}' created", "folder": item.to_dict()}
 
+
+# ═══════════════════════════════════════
+#   API — Download
+# ═══════════════════════════════════════
 
 @app.get("/api/download/{path:path}")
 async def download_file(path: str):
     filepath = safe_path(path)
-
     if not filepath.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
     if filepath.is_dir():
-        zip_path = UPLOAD_DIR / f".tmp_{filepath.name}"
-        shutil.make_archive(str(zip_path), "zip", filepath)
+        zip_base = UPLOAD_DIR / f".tmp_{filepath.name}"
+        shutil.make_archive(str(zip_base), "zip", filepath)
         return FileResponse(
-            f"{zip_path}.zip",
+            f"{zip_base}.zip",
             filename=f"{filepath.name}.zip",
             media_type="application/zip",
         )
@@ -221,131 +291,194 @@ async def download_file(path: str):
     return FileResponse(filepath, filename=filepath.name)
 
 
+# ═══════════════════════════════════════
+#   API — Preview
+# ═══════════════════════════════════════
+
 @app.get("/api/preview/{path:path}")
 async def preview_file(path: str):
     filepath = safe_path(path)
-
     if not filepath.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
     mime_type, _ = mimetypes.guess_type(filepath.name)
     mime_type = mime_type or "application/octet-stream"
 
-    text_extensions = [
+    text_exts = {
         ".txt", ".py", ".js", ".html", ".css", ".json", ".md",
         ".yml", ".yaml", ".sh", ".bat", ".tsx", ".jsx", ".ts",
         ".vue", ".sql", ".xml", ".csv", ".log", ".ini", ".env",
-    ]
-
-    if filepath.suffix.lower() in text_extensions:
+    }
+    if filepath.suffix.lower() in text_exts:
         content = filepath.read_text(encoding="utf-8", errors="replace")
         return {"type": "text", "content": content}
 
     return FileResponse(filepath, media_type=mime_type)
 
 
-@app.delete("/api/files/{path:path}")
-async def delete_file_by_path(path: str):
-    filepath = safe_path(path)
-
-    if not filepath.exists():
-        raise HTTPException(status_code=404, detail="Not found")
-
-    if filepath.is_dir():
-        shutil.rmtree(filepath)
-    else:
-        filepath.unlink()
-
-    return {"message": f"'{filepath.name}' deleted"}
-
+# ═══════════════════════════════════════
+#   API — Delete (permanent)
+# ═══════════════════════════════════════
 
 @app.delete("/api/delete")
-async def delete_file_by_body(data: dict):
-    file_path = data.get("path", "")
+async def delete_file(data: dict, db: Session = Depends(get_db)):
+    file_path = data.get("path", "").strip("/")
     if not file_path:
         raise HTTPException(status_code=400, detail="Path is required")
 
     filepath = safe_path(file_path)
-
     if not filepath.exists():
         raise HTTPException(status_code=404, detail="Not found")
 
+    # Xóa trên disk
     if filepath.is_dir():
         shutil.rmtree(filepath)
     else:
         filepath.unlink()
 
+    # Xóa trong DB
+    item = db.query(FileItem).filter(FileItem.path == file_path).first()
+    if item:
+        # Nếu là folder, xóa cả children
+        if item.is_dir:
+            db.query(FileItem).filter(
+                FileItem.path.startswith(file_path + "/")
+            ).delete(synchronize_session=False)
+        db.delete(item)
+        db.commit()
+
     return {"message": f"'{filepath.name}' deleted"}
 
 
+# ═══════════════════════════════════════
+#   API — Rename
+# ═══════════════════════════════════════
+
 @app.put("/api/rename")
-async def rename_file(data: dict):
-    old_path = data.get("old_path") or data.get("path", "")
+async def rename_file(data: dict, db: Session = Depends(get_db)):
+    old_path = (data.get("old_path") or data.get("path", "")).strip("/")
     new_name = data.get("new_name", "").strip()
 
     if not new_name:
         raise HTTPException(status_code=400, detail="New name is required")
 
     new_name = new_name.replace("/", "_").replace("\\", "_")
-    source = safe_path(old_path)
+    source   = safe_path(old_path)
 
     if not source.exists():
         raise HTTPException(status_code=404, detail="Not found")
 
     destination = source.parent / new_name
-
     if destination.exists():
         raise HTTPException(status_code=409, detail="Name already exists")
 
     source.rename(destination)
 
-    return {
-        "message": f"Renamed to '{new_name}'",
-        "file": get_file_info(destination),
-    }
+    # Update DB
+    item = db.query(FileItem).filter(FileItem.path == old_path).first()
+    if item:
+        new_rel = str(destination.relative_to(UPLOAD_DIR)).replace("\\", "/")
+
+        # Nếu là folder, update path của tất cả children
+        if item.is_dir:
+            children = db.query(FileItem).filter(
+                FileItem.path.startswith(old_path + "/")
+            ).all()
+            for child in children:
+                child.path        = child.path.replace(old_path, new_rel, 1)
+                child.parent_path = str(
+                    (UPLOAD_DIR / child.path).parent.relative_to(UPLOAD_DIR)
+                ).replace("\\", "/")
+                if child.parent_path == ".":
+                    child.parent_path = ""
+
+        item.name       = new_name
+        item.path       = new_rel
+        item.file_type, item.mime_type = detect_file_type(destination)
+        item.updated_at = datetime.utcnow()
+
+        db.commit()
+        db.refresh(item)
+        return {"message": f"Renamed to '{new_name}'", "file": item.to_dict()}
+
+    item = sync_file_to_db(destination, db)
+    return {"message": f"Renamed to '{new_name}'", "file": item.to_dict()}
 
 
-@app.post("/api/move")
-async def move_file(data: dict):
-    source_path = data.get("source", "")
-    dest_path = data.get("destination", "")
+# ═══════════════════════════════════════
+#   API — Starred
+# ═══════════════════════════════════════
 
-    source = safe_path(source_path)
-    dest_dir = safe_path(dest_path)
+@app.post("/api/star")
+async def toggle_star(data: dict, db: Session = Depends(get_db)):
+    file_path = data.get("path", "").strip("/")
+    if not file_path:
+        raise HTTPException(status_code=400, detail="Path is required")
 
-    if not source.exists():
-        raise HTTPException(status_code=404, detail="Source not found")
+    item = db.query(FileItem).filter(FileItem.path == file_path).first()
+    if not item:
+        filepath = safe_path(file_path)
+        if not filepath.exists():
+            raise HTTPException(status_code=404, detail="Not found")
+        item = sync_file_to_db(filepath, db)
 
-    if not dest_dir.is_dir():
-        raise HTTPException(status_code=400, detail="Destination must be a folder")
+    item.is_starred = not item.is_starred
+    db.commit()
 
-    destination = dest_dir / source.name
+    action = "Starred" if item.is_starred else "Unstarred"
+    return {"message": f"{action} '{item.name}'", "is_starred": item.is_starred}
 
-    if destination.exists():
-        raise HTTPException(status_code=409, detail="Item already exists in destination")
 
-    shutil.move(str(source), str(destination))
+@app.get("/api/starred")
+async def list_starred(db: Session = Depends(get_db)):
+    items = (
+        db.query(FileItem)
+        .filter(FileItem.is_starred == True)
+        .order_by(FileItem.name)
+        .all()
+    )
+    return {"items": [item.to_dict() for item in items]}
 
-    return {"message": f"Moved '{source.name}'"}
 
+# ═══════════════════════════════════════
+#   API — Search
+# ═══════════════════════════════════════
 
 @app.get("/api/search")
-async def search_files(q: str = "", path: str = ""):
+async def search_files(q: str = "", path: str = "", db: Session = Depends(get_db)):
     if not q:
         return {"results": []}
 
-    search_root = safe_path(path)
-    results = []
-    query = q.lower()
+    results = (
+        db.query(FileItem)
+        .filter(FileItem.name.ilike(f"%{q}%"))
+        .order_by(FileItem.is_dir.desc(), FileItem.name)
+        .limit(50)
+        .all()
+    )
 
-    for item in search_root.rglob("*"):
-        if not item.name.startswith(".") and query in item.name.lower():
-            results.append(get_file_info(item))
-            if len(results) >= 50:
-                break
+    return {"results": [item.to_dict() for item in results], "query": q}
 
-    return {"results": results, "query": q}
 
+# ═══════════════════════════════════════
+#   API — Full Sync (utility)
+# ═══════════════════════════════════════
+
+@app.post("/api/sync")
+async def full_sync(db: Session = Depends(get_db)):
+    """Scan toàn bộ uploads/ và sync vào DB."""
+    count = 0
+    for item in UPLOAD_DIR.rglob("*"):
+        if item.name.startswith("."):
+            continue
+        sync_file_to_db(item, db)
+        count += 1
+    return {"message": f"Synced {count} items"}
+
+
+# ═══════════════════════════════════════
+#   RUN
+# ═══════════════════════════════════════
 
 if __name__ == "__main__":
     import uvicorn
