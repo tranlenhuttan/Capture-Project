@@ -2,9 +2,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
-# ═══════════════════════════════════════
-#   CẤU HÌNH — Đổi cho phù hợp máy bạn
-# ═══════════════════════════════════════
 
 MYSQL_USER     = "root"
 MYSQL_PASSWORD = "Ngusaonoi0121$$"
@@ -20,9 +17,9 @@ DATABASE_URL = (
 
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,        # tự reconnect nếu connection bị drop
-    pool_recycle=3600,         # recycle connection sau 1 giờ
-    echo=False,                # True nếu muốn xem SQL log
+    pool_pre_ping=True,       
+    pool_recycle=3600,        
+    echo=False,              
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -41,5 +38,5 @@ def get_db():
 
 def init_db():
     """Tạo tất cả tables (nếu chưa có)."""
-    from models import FileItem  # noqa — import để Base nhận biết model
+    from models import FileItem  
     Base.metadata.create_all(bind=engine)

@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Capture Project</title>
+    <title>RoomCast Project</title>
     <link rel="stylesheet" href="/static/css/style.css" />
     <link rel="icon" type="image/x-icon" href="/static/images/favicon.ico" />
     <link
@@ -12,35 +12,57 @@
     />
   </head>
   <body>
-    <!-- ═══ Sidebar ═══ -->
     <aside class="sidebar" id="sidebar">
-      <div class="sidebar-header">
-        <div class="logo">
-          <img src="/static/images/logo.png" alt="Logo" class="logo-img" />
-          <span>Capture Project</span>
-        </div>
+      <div class="logo">
+        <img src="/static/images/logo.png" alt="Logo" class="logo-img" />
+        <span>RoomCast Project</span>
       </div>
-
       <button
         class="btn-upload"
         onclick="document.getElementById('fileInput').click()"
       >
-        <span class="material-icons-round">add</span>
-        <span>Upload</span>
+        <span class="material-icons-round">add</span> Upload
       </button>
       <input type="file" id="fileInput" multiple hidden />
-
       <nav class="sidebar-nav">
-        <a href="#" class="nav-item active" id="navFiles">
-          <span class="material-icons-round">folder_open</span>
-          <span>My Files</span>
+        <a
+          href="#"
+          class="nav-item active"
+          id="navFiles"
+          onclick="
+            fetchFiles('');
+            return false;
+          "
+        >
+          <span class="material-icons-round">folder_open</span
+          ><span>My Files</span>
         </a>
-        <a href="#" class="nav-item" id="navStarred">
-          <span class="material-icons-round">star_outline</span>
-          <span>Starred</span>
+        <a
+          href="#"
+          class="nav-item"
+          id="navStarred"
+          onclick="
+            fetchStarred();
+            return false;
+          "
+        >
+          <span class="material-icons-round">star_outline</span
+          ><span>Starred</span>
+        </a>
+        <a
+          href="#"
+          class="nav-item"
+          id="navCollections"
+          onclick="
+            openCollectionsView();
+            return false;
+          "
+        >
+          <span class="material-icons-round">photo_library</span
+          ><span>Collections</span>
+          <span class="col-badge hidden" id="colsBadge">0</span>
         </a>
       </nav>
-
       <div class="storage-info">
         <div class="storage-bar">
           <div class="storage-fill" id="storageFill"></div>
@@ -49,55 +71,124 @@
       </div>
     </aside>
 
-    <!-- ═══ Main ═══ -->
     <main class="main">
-      <!-- Topbar -->
       <header class="topbar">
         <button class="btn-icon mobile-menu" id="mobileMenu">
           <span class="material-icons-round">menu</span>
         </button>
-
         <div class="search-bar">
           <span class="material-icons-round">search</span>
           <input
             type="text"
             id="searchInput"
-            placeholder="Search in Capture Project"
+            placeholder="Search in RoomCast Project"
           />
         </div>
-
         <button class="btn-icon" id="toggleView">
           <span class="material-icons-round" id="viewIcon">grid_view</span>
         </button>
       </header>
 
-      <!-- Breadcrumb -->
       <div class="breadcrumb-bar">
         <div class="breadcrumb" id="breadcrumb"></div>
         <div class="file-count" id="fileCount"></div>
       </div>
 
-      <!-- Toolbar -->
+      <!-- Files toolbar -->
       <div class="toolbar" id="toolbar">
         <button class="btn-tool" onclick="showNewFolderDialog()">
-          <span class="material-icons-round">create_new_folder</span>
-          <span>New Folder</span>
+          <span class="material-icons-round">create_new_folder</span
+          ><span>New Folder</span>
         </button>
         <button class="btn-tool" onclick="sortFiles('name')">
-          <span class="material-icons-round">sort_by_alpha</span>
-          <span>Name</span>
+          <span class="material-icons-round">sort_by_alpha</span
+          ><span>Name</span>
         </button>
         <button class="btn-tool" onclick="sortFiles('date')">
-          <span class="material-icons-round">calendar_today</span>
-          <span>Date</span>
+          <span class="material-icons-round">calendar_today</span
+          ><span>Date</span>
         </button>
         <button class="btn-tool" onclick="sortFiles('size')">
-          <span class="material-icons-round">straighten</span>
-          <span>Size</span>
+          <span class="material-icons-round">straighten</span><span>Size</span>
         </button>
       </div>
 
-      <!-- Drop Zone -->
+      <!-- Collections list toolbar -->
+      <div class="toolbar hidden" id="toolbarCollections">
+        <button
+          class="btn-tool btn-tool-accent"
+          onclick="showNewCollectionDialog()"
+        >
+          <span class="material-icons-round">create_new_folder</span
+          ><span>New Collection</span>
+        </button>
+      </div>
+
+      <!-- Collection Detail toolbar -->
+      <div class="toolbar toolbar-detail hidden" id="toolbarColDetail">
+        <button class="btn-tool" onclick="openCollectionsView()">
+          <span class="material-icons-round">arrow_back</span
+          ><span>Collections</span>
+        </button>
+        <div class="toolbar-sep"></div>
+        <button class="btn-tool btn-tool-accent" id="colDetailPlayBtn">
+          <span class="material-icons-round">play_arrow</span><span>Play</span>
+        </button>
+        <div class="toolbar-sep"></div>
+        <div class="toolbar-ctrl-group">
+          <span class="toolbar-ctrl-label">Transition</span>
+          <div class="col-range-wrap">
+            <input
+              type="range"
+              id="colDetailTransSpeed"
+              min="0.1"
+              max="4.0"
+              step="0.1"
+              value="1.0"
+            />
+            <span class="col-range-val" id="colDetailTransVal">1.0s</span>
+          </div>
+        </div>
+        <div class="toolbar-ctrl-group">
+          <span class="toolbar-ctrl-label">Duration</span>
+          <div class="col-range-wrap">
+            <input
+              type="range"
+              id="colDetailDispTime"
+              min="1"
+              max="60"
+              step="1"
+              value="5"
+            />
+            <span class="col-range-val" id="colDetailTimeVal">5s</span>
+          </div>
+        </div>
+        <div class="toolbar-sep"></div>
+        <div class="toolbar-ctrl-group">
+          <span class="toolbar-ctrl-label">Music</span>
+          <div class="col-music-opts">
+            <label class="col-music-opt"
+              ><input type="radio" name="colMusic" value="0" checked /><span
+                class="material-icons-round"
+                >music_off</span
+              >Off</label
+            >
+            <label class="col-music-opt"
+              ><input type="radio" name="colMusic" value="1" /><span
+                class="material-icons-round"
+                >music_note</span
+              >Track 1</label
+            >
+            <label class="col-music-opt"
+              ><input type="radio" name="colMusic" value="2" /><span
+                class="material-icons-round"
+                >music_note</span
+              >Track 2</label
+            >
+          </div>
+        </div>
+      </div>
+
       <div class="drop-overlay" id="dropOverlay">
         <div class="drop-content">
           <span class="material-icons-round">cloud_upload</span>
@@ -105,21 +196,21 @@
         </div>
       </div>
 
-      <!-- Files Grid -->
       <div class="files-container" id="filesContainer">
         <div class="files-grid" id="filesGrid"></div>
       </div>
 
-      <!-- Empty State -->
       <div class="empty-state hidden" id="emptyState">
         <span class="material-icons-round">cloud_off</span>
         <h3>No files here</h3>
         <p>Upload files or create a folder to get started</p>
       </div>
 
-      <!-- Upload Progress -->
       <div class="upload-progress hidden" id="uploadProgress">
-        <span>Uploading...</span>
+        <div class="upload-info">
+          <span class="material-icons-round">cloud_upload</span
+          ><span>Uploading…</span>
+        </div>
         <div class="upload-bar">
           <div class="upload-fill" id="uploadFill"></div>
         </div>
@@ -127,12 +218,16 @@
       </div>
     </main>
 
-    <!-- ═══ Context Menu (dynamic) ═══ -->
+    <!-- Context Menu -->
     <div class="context-menu hidden" id="contextMenu">
       <div class="ctx-menu-inner"></div>
     </div>
+    <!-- Add-to-collection sub-menu -->
+    <div class="context-menu ctx-submenu hidden" id="addToColMenu">
+      <div class="ctx-menu-inner" id="addToColInner"></div>
+    </div>
 
-    <!-- ═══ Preview Modal ═══ -->
+    <!-- Preview Modal -->
     <div class="modal-overlay hidden" id="previewModal">
       <div class="modal modal-preview">
         <div class="modal-header">
@@ -145,7 +240,7 @@
       </div>
     </div>
 
-    <!-- ═══ New Folder Modal ═══ -->
+    <!-- New Folder Modal -->
     <div class="modal-overlay hidden" id="folderModal">
       <div class="modal">
         <div class="modal-header">
@@ -166,7 +261,7 @@
       </div>
     </div>
 
-    <!-- ═══ Rename Modal ═══ -->
+    <!-- Rename Modal -->
     <div class="modal-overlay hidden" id="renameModal">
       <div class="modal">
         <div class="modal-header">
@@ -187,9 +282,106 @@
       </div>
     </div>
 
-    <!-- ═══ Toast ═══ -->
-    <div class="toast-container" id="toastContainer"></div>
+    <!-- New Collection Modal -->
+    <div class="modal-overlay hidden" id="newCollectionModal">
+      <div class="modal">
+        <div class="modal-header">
+          <h3>New Collection</h3>
+          <button class="btn-icon" onclick="closeModal('newCollectionModal')">
+            <span class="material-icons-round">close</span>
+          </button>
+        </div>
+        <div class="modal-body">
+          <div class="form-field">
+            <label>Collection Name</label>
+            <input
+              type="text"
+              id="newColNameInput"
+              placeholder="e.g. Summer 2025"
+            />
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button
+            class="btn-secondary"
+            onclick="closeModal('newCollectionModal')"
+          >
+            Cancel
+          </button>
+          <button
+            class="btn-primary"
+            id="newColCreateBtn"
+            onclick="submitNewCollection()"
+          >
+            <span class="material-icons-round" style="font-size: 16px"
+              >create_new_folder</span
+            >
+            Create
+          </button>
+        </div>
+      </div>
+    </div>
 
+    <!-- Slideshow Player -->
+    <div class="ss-player hidden" id="ssPlayer">
+      <div class="ss-slides" id="ssSlides"></div>
+      <button class="ss-nav-btn ss-nav-left" id="ssBtnLeft">
+        <span class="material-icons-round">chevron_left</span>
+      </button>
+      <button class="ss-nav-btn ss-nav-right" id="ssBtnRight">
+        <span class="material-icons-round">chevron_right</span>
+      </button>
+
+      <div class="ss-top-bar">
+        <div class="ss-title" id="ssTitle"></div>
+        <div class="ss-counter" id="ssCounter"></div>
+        <button class="ss-icon-btn" id="ssBtnClose">
+          <span class="material-icons-round">close</span>
+        </button>
+      </div>
+
+      <div class="ss-bottom-bar">
+        <div class="ss-progress-track" id="ssProgressTrack">
+          <div class="ss-progress-pos" id="ssProgressPos"></div>
+          <div class="ss-progress-auto" id="ssProgressAuto"></div>
+        </div>
+        <div class="ss-controls-row">
+          <div class="ss-music-tag hidden" id="ssMusicTag">
+            <span class="material-icons-round">music_note</span>
+            <span id="ssMusicTagName"></span>
+          </div>
+          <div class="ss-center-btns">
+            <button class="ss-icon-btn" id="ssBtnPrev">
+              <span class="material-icons-round">skip_previous</span>
+            </button>
+            <button class="ss-play-btn ss-icon-btn" id="ssBtnPlay">
+              <span class="material-icons-round" id="ssPlayIcon"
+                >play_arrow</span
+              >
+            </button>
+            <button class="ss-icon-btn" id="ssBtnNext">
+              <span class="material-icons-round">skip_next</span>
+            </button>
+          </div>
+          <div class="ss-right-controls">
+            <div class="ss-vol-ctrl hidden" id="ssVolCtrl">
+              <span class="material-icons-round ss-ctrl-icon">volume_up</span>
+              <input
+                type="range"
+                class="ss-slider"
+                id="ssVolSlider"
+                min="0"
+                max="100"
+                value="55"
+              />
+            </div>
+          </div>
+        </div>
+        <div class="ss-filmstrip" id="ssFilmstrip"></div>
+      </div>
+    </div>
+
+    <div class="toast-container" id="toastContainer"></div>
     <script src="/static/js/app.js"></script>
   </body>
 </html>

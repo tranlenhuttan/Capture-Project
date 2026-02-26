@@ -1,15 +1,35 @@
-/* ═══════════════════════════════════════
+/* ═══════════════════════════════════════════
    STATE
-   ═══════════════════════════════════════ */
-
+═══════════════════════════════════════════ */
 let currentPath = "";
 let currentFiles = [];
 let currentSort = { key: "name", asc: true };
-let currentView = "files"; // "files" | "starred"
+let currentView = "files"; // "files"|"starred"|"collections"|"collectionDetail"
 let isGridView = true;
 let contextFile = null;
+let renameTarget = null;
 let dragCounter = 0;
 let searchTimeout = null;
+let collections = [];
+let currentCollection = null;
+
+// Slideshow state
+let ss = {
+  items: [],
+  idx: 0,
+  playing: false,
+  displayTime: 5,
+  transSpeed: 1.0,
+  timer: null,
+  audio: null,
+  colId: null,
+};
+
+// Preset music tracks — place these files in static/music/
+const MUSIC_TRACKS = {
+  1: { name: "Track 1", src: "/static/music/track1.mp3" },
+  2: { name: "Track 2", src: "/static/music/track2.mp3" },
+};
 
 const FILE_ICONS = {
   folder: { icon: "folder", css: "folder" },
@@ -23,804 +43,1307 @@ const FILE_ICONS = {
   default: { icon: "insert_drive_file", css: "file" },
 };
 
-/* ═══════════════════════════════════════
+/* ═══════════════════════════════════════════
    UTILS
-   ═══════════════════════════════════════ */
-
-function escapeHtml(str) {
-  const div = document.createElement("div");
-  div.textContent = str;
-  return div.innerHTML;
+═══════════════════════════════════════════ */
+function esc(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
 }
-
-function formatSize(bytes) {
-  if (!bytes || bytes === 0) return "—";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + " " + units[i];
+function fmtSize(b) {
+  if (!b) return "—";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.min(Math.floor(Math.log(b) / Math.log(1024)), u.length - 1);
+  return (b / Math.pow(1024, i)).toFixed(i ? 1 : 0) + " " + u[i];
 }
-
-function formatDate(dateStr) {
-  if (!dateStr) return "";
-  const d = new Date(dateStr);
-  return d.toLocaleDateString("en-US", {
+function fmtDate(s) {
+  if (!s) return "";
+  return new Date(s).toLocaleDateString("en-US", {
     month: "short",
     day: "numeric",
     year: "numeric",
   });
 }
-
 function isTyping() {
-  const tag = document.activeElement?.tagName;
-  return tag === "INPUT" || tag === "TEXTAREA";
+  const t = document.activeElement?.tagName;
+  return t === "INPUT" || t === "TEXTAREA";
+}
+function $(id) {
+  return document.getElementById(id);
+}
+function debounce(fn, ms) {
+  let t;
+  return (...a) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...a), ms);
+  };
 }
 
-/* ═══════════════════════════════════════
-   API CALLS
-   ═══════════════════════════════════════ */
-
+/* ═══════════════════════════════════════════
+   API — Files
+═══════════════════════════════════════════ */
 async function fetchFiles(path = "") {
   try {
-    const res = await fetch(`/api/files?path=${encodeURIComponent(path)}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-
+    const r = await fetch(`/api/files?path=${encodeURIComponent(path)}`);
+    if (!r.ok) throw new Error();
+    const d = await r.json();
     currentPath = path;
     currentView = "files";
-    currentFiles = data.items || [];
-
-    setActiveNav("navFiles");
+    currentFiles = d.items || [];
+    setNav("navFiles");
+    renderBreadcrumb();
     renderFiles();
-    renderBreadcrumb(data.breadcrumb || []);
     updateFileCount();
-    updateStorage(data.storage);
-    updateToolbarVisibility();
-  } catch (err) {
-    console.error("fetchFiles error:", err);
+    updateStorage(d.storage);
+    showToolbar("files");
+  } catch {
     showToast("Failed to load files", "error");
   }
 }
 
 async function fetchStarred() {
   try {
-    const res = await fetch("/api/starred");
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-
+    const r = await fetch("/api/starred");
+    if (!r.ok) throw new Error();
+    const d = await r.json();
     currentView = "starred";
-    currentFiles = data.items || [];
+    currentFiles = d.items || [];
     currentPath = "";
-
-    setActiveNav("navStarred");
-    renderFiles();
+    setNav("navStarred");
     renderViewHeader("Starred", "star", currentFiles.length);
-    updateToolbarVisibility();
-  } catch (err) {
-    showToast("Failed to load starred files", "error");
+    renderFiles();
+    showToolbar("none");
+  } catch {
+    showToast("Failed to load starred", "error");
   }
 }
 
-async function apiSearch(query) {
+async function doSearch(q) {
   try {
-    const res = await fetch(
-      `/api/search?q=${encodeURIComponent(query)}&path=${encodeURIComponent(currentPath)}`,
+    const r = await fetch(
+      `/api/search?q=${encodeURIComponent(q)}&path=${encodeURIComponent(currentPath)}`,
     );
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
-  } catch (err) {
-    showToast("Search failed", "error");
-    return { results: [] };
+    return r.ok ? (await r.json()).results || [] : [];
+  } catch {
+    return [];
   }
 }
 
 async function apiUpload(files) {
-  const formData = new FormData();
-  formData.append("path", currentPath);
-  for (const file of files) formData.append("files", file);
-
-  const progressEl = document.getElementById("uploadProgress");
-  const fillEl = document.getElementById("uploadFill");
-  const statusEl = document.getElementById("uploadStatus");
-
-  progressEl.classList.remove("hidden");
-  fillEl.style.width = "0%";
-  statusEl.textContent = `Uploading ${files.length} file(s)...`;
-
+  const fd = new FormData();
+  fd.append("path", currentPath);
+  for (const f of files) fd.append("files", f);
+  const prog = $("uploadProgress"),
+    fill = $("uploadFill"),
+    stat = $("uploadStatus");
+  prog.classList.remove("hidden");
+  fill.style.width = "0%";
+  stat.textContent = `Uploading ${files.length} file(s)…`;
   try {
-    await new Promise((resolve, reject) => {
+    await new Promise((res, rej) => {
       const xhr = new XMLHttpRequest();
-      xhr.upload.addEventListener("progress", (e) => {
+      xhr.upload.onprogress = (e) => {
         if (e.lengthComputable) {
-          const pct = Math.round((e.loaded / e.total) * 100);
-          fillEl.style.width = pct + "%";
-          statusEl.textContent = `${pct}% — ${files.length} file(s)`;
+          const p = Math.round((e.loaded / e.total) * 100);
+          fill.style.width = p + "%";
+          stat.textContent = p + "% — " + files.length + " file(s)";
         }
-      });
-      xhr.addEventListener("load", () => {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          showToast(`Uploaded ${files.length} file(s)`, "success");
-          fetchFiles(currentPath);
-          resolve();
-        } else reject(new Error(`HTTP ${xhr.status}`));
-      });
-      xhr.addEventListener("error", () => reject(new Error("Network error")));
+      };
+      xhr.onload = () =>
+        xhr.status < 300
+          ? (showToast(`Uploaded ${files.length} file(s)`),
+            fetchFiles(currentPath),
+            res())
+          : rej();
+      xhr.onerror = rej;
       xhr.open("POST", "/api/upload");
-      xhr.send(formData);
+      xhr.send(fd);
     });
-  } catch (err) {
+  } catch {
     showToast("Upload failed", "error");
   } finally {
-    setTimeout(() => progressEl.classList.add("hidden"), 1500);
+    setTimeout(() => prog.classList.add("hidden"), 1500);
   }
 }
 
 async function apiCreateFolder(name) {
   try {
-    const res = await fetch("/api/folder", {
+    const r = await fetch("/api/folder", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: currentPath, name }),
     });
-    if (!res.ok)
-      throw new Error(
-        (await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`,
-      );
-    showToast(`Created folder "${name}"`, "success");
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || "");
+    showToast(`Created "${name}"`);
     fetchFiles(currentPath);
-  } catch (err) {
-    showToast(err.message || "Failed to create folder", "error");
+  } catch (e) {
+    showToast(e.message || "Failed", "error");
   }
 }
 
-async function apiRename(oldPath, newName) {
+async function apiRename(old, name) {
   try {
-    const res = await fetch("/api/rename", {
+    const r = await fetch("/api/rename", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ old_path: oldPath, new_name: newName }),
+      body: JSON.stringify({ old_path: old, new_name: name }),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    showToast("Renamed successfully", "success");
-    refreshCurrentView();
-  } catch (err) {
+    if (!r.ok) throw new Error();
+    showToast("Renamed");
+    refreshView();
+  } catch {
     showToast("Rename failed", "error");
   }
 }
 
-async function apiDelete(filePath) {
+async function apiDelete(path) {
   try {
-    const res = await fetch("/api/delete", {
+    const r = await fetch("/api/delete", {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: filePath }),
+      body: JSON.stringify({ path }),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    showToast("File deleted", "success");
-    refreshCurrentView();
-  } catch (err) {
+    if (!r.ok) throw new Error();
+    showToast("Deleted");
+    refreshView();
+  } catch {
     showToast("Delete failed", "error");
   }
 }
 
-async function apiToggleStar(filePath) {
+async function apiStar(path) {
   try {
-    const res = await fetch("/api/star", {
+    const r = await fetch("/api/star", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: filePath }),
+      body: JSON.stringify({ path }),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    showToast(data.message, "success");
-    refreshCurrentView();
-  } catch (err) {
-    showToast("Failed to toggle star", "error");
+    if (!r.ok) throw new Error();
+    const d = await r.json();
+    showToast(d.message);
+    refreshView();
+  } catch {
+    showToast("Failed", "error");
   }
 }
 
-async function apiPreview(filePath) {
+async function apiPreview(path) {
   try {
-    const res = await fetch(`/api/preview/${encodeURIComponent(filePath)}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const contentType = res.headers.get("content-type") || "";
-    if (contentType.includes("application/json")) return await res.json();
-    return null;
-  } catch (err) {
+    const r = await fetch(`/api/preview/${encodeURIComponent(path)}`);
+    if (!r.ok) throw new Error();
+    const ct = r.headers.get("content-type") || "";
+    return ct.includes("json") ? await r.json() : null;
+  } catch {
     return null;
   }
 }
 
-function refreshCurrentView() {
-  switch (currentView) {
-    case "files":
-      fetchFiles(currentPath);
-      break;
-    case "starred":
-      fetchStarred();
-      break;
+function refreshView() {
+  if (currentView === "files") fetchFiles(currentPath);
+  else if (currentView === "starred") fetchStarred();
+  else if (currentView === "collections") openCollectionsView();
+  else if (currentView === "collectionDetail" && currentCollection)
+    openCollectionDetail(currentCollection.id);
+}
+
+/* ═══════════════════════════════════════════
+   API — Collections
+═══════════════════════════════════════════ */
+async function apiListCollections() {
+  try {
+    const r = await fetch("/api/collections");
+    if (!r.ok) throw new Error();
+    const d = await r.json();
+    collections = d.collections || [];
+    updateColBadge();
+    return collections;
+  } catch {
+    return [];
   }
 }
 
-/* ═══════════════════════════════════════
-   SORTING
-   ═══════════════════════════════════════ */
+async function apiGetCollection(id) {
+  const r = await fetch(`/api/collections/${id}`);
+  if (!r.ok) throw new Error();
+  return await r.json();
+}
 
+async function apiCreateColFolder(name) {
+  const r = await fetch("/api/collections", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!r.ok)
+    throw new Error((await r.json().catch(() => ({}))).detail || "Failed");
+  return await r.json();
+}
+
+async function apiUpdateCollection(id, data) {
+  const r = await fetch(`/api/collections/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!r.ok) throw new Error();
+  return await r.json();
+}
+
+async function apiDeleteCollection(id) {
+  const r = await fetch(`/api/collections/${id}`, { method: "DELETE" });
+  if (!r.ok) throw new Error();
+}
+
+async function apiAddImageToCol(colId, filePath) {
+  const r = await fetch(`/api/collections/${colId}/add-image`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ file_path: filePath }),
+  });
+  if (!r.ok)
+    throw new Error((await r.json().catch(() => ({}))).detail || "Failed");
+  return await r.json();
+}
+
+async function apiRemoveImageFromCol(colId, filePath) {
+  const r = await fetch(`/api/collections/${colId}/remove-image`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ file_path: filePath }),
+  });
+  if (!r.ok) throw new Error();
+  return await r.json();
+}
+
+/* ═══════════════════════════════════════════
+   SORT
+═══════════════════════════════════════════ */
 function sortItems(items) {
   return [...items].sort((a, b) => {
     if (a.type === "folder" && b.type !== "folder") return -1;
     if (a.type !== "folder" && b.type === "folder") return 1;
-    let valA, valB;
-    switch (currentSort.key) {
-      case "name":
-        valA = (a.name || "").toLowerCase();
-        valB = (b.name || "").toLowerCase();
-        return currentSort.asc
-          ? valA.localeCompare(valB)
-          : valB.localeCompare(valA);
-      case "date":
-        valA = new Date(a.modified || 0).getTime();
-        valB = new Date(b.modified || 0).getTime();
-        break;
-      case "size":
-        valA = a.size || 0;
-        valB = b.size || 0;
-        break;
-      default:
-        return 0;
+    let va, vb;
+    if (currentSort.key === "name") {
+      va = (a.name || "").toLowerCase();
+      vb = (b.name || "").toLowerCase();
+      return currentSort.asc ? va.localeCompare(vb) : vb.localeCompare(va);
     }
-    return currentSort.asc ? valA - valB : valB - valA;
+    if (currentSort.key === "date") {
+      va = new Date(a.modified || 0).getTime();
+      vb = new Date(b.modified || 0).getTime();
+    }
+    if (currentSort.key === "size") {
+      va = a.size || 0;
+      vb = b.size || 0;
+    }
+    return currentSort.asc ? va - vb : vb - va;
   });
 }
 
-/* ═══════════════════════════════════════
-   RENDER — File Cards
-   ═══════════════════════════════════════ */
-
+/* ═══════════════════════════════════════════
+   RENDER — File Grid
+═══════════════════════════════════════════ */
 function createFileCard(item) {
-  const iconData = FILE_ICONS[item.file_type] || FILE_ICONS.default;
-  const isImage = item.file_type === "image";
-  const isFolder = item.type === "folder";
-
-  let previewHtml;
-  if (isImage) {
-    previewHtml = `<img src="/uploads/${encodeURIComponent(item.path)}" alt="${escapeHtml(item.name)}" loading="lazy">`;
-  } else {
-    previewHtml = `<span class="material-icons-round file-icon ${iconData.css}">${iconData.icon}</span>`;
-  }
-
-  const sizeTxt = isFolder ? "" : formatSize(item.size);
-  const dateTxt = formatDate(item.modified);
-  const metaParts = [sizeTxt, dateTxt].filter(Boolean);
-
-  const starBadge = item.is_starred
-    ? `<span class="star-badge material-icons-round" title="Starred">star</span>`
+  const ic = FILE_ICONS[item.file_type] || FILE_ICONS.default;
+  const preview =
+    item.file_type === "image"
+      ? `<img src="/uploads/${encodeURIComponent(item.path)}" loading="lazy" alt="">`
+      : `<span class="material-icons-round file-icon ${ic.css}">${ic.icon}</span>`;
+  const meta = [
+    item.type !== "folder" ? fmtSize(item.size) : "",
+    fmtDate(item.modified),
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const star = item.is_starred
+    ? `<span class="star-badge material-icons-round">star</span>`
     : "";
-
   return `
-    <div class="file-card" data-path="${escapeHtml(item.path)}" data-id="${item.id || ""}">
-      <div class="file-card-preview">
-        ${previewHtml}
-        ${starBadge}
+    <div class="file-card" data-path="${esc(item.path)}">
+      <div class="card-preview">${preview}${star}</div>
+      <div class="card-info">
+        <div class="card-name" title="${esc(item.name)}">${esc(item.name)}</div>
+        <div class="card-meta">${esc(meta)}</div>
       </div>
-      <div class="file-card-info">
-        <div class="file-card-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</div>
-        <div class="file-card-meta">${escapeHtml(metaParts.join(" · "))}</div>
-      </div>
-      <div class="file-card-actions">
-        <button class="btn-icon btn-more" title="More">
-          <span class="material-icons-round">more_vert</span>
-        </button>
-      </div>
-    </div>
-  `;
+      <button class="btn-more btn-icon"><span class="material-icons-round">more_vert</span></button>
+    </div>`;
 }
 
 function renderFiles() {
-  const grid = document.getElementById("filesGrid");
-  const emptyState = document.getElementById("emptyState");
-  const container = document.getElementById("filesContainer");
+  const grid = $("filesGrid"),
+    empty = $("emptyState"),
+    cont = $("filesContainer");
   const sorted = sortItems(currentFiles);
-
   grid.classList.toggle("list-view", !isGridView);
-
-  if (sorted.length === 0) {
+  if (!sorted.length) {
     grid.innerHTML = "";
-    container.classList.add("hidden");
-    emptyState.classList.remove("hidden");
-
-    const emptyIcon = emptyState.querySelector(".material-icons-round");
-    const emptyH3 = emptyState.querySelector("h3");
-    const emptyP = emptyState.querySelector("p");
-
+    cont.classList.add("hidden");
+    empty.classList.remove("hidden");
     if (currentView === "starred") {
-      emptyIcon.textContent = "star_outline";
-      emptyH3.textContent = "No starred files";
-      emptyP.textContent = "Star files to find them quickly here";
+      empty.querySelector(".material-icons-round").textContent = "star_outline";
+      empty.querySelector("h3").textContent = "No starred files";
+      empty.querySelector("p").textContent =
+        "Star files to find them quickly here";
     } else {
-      emptyIcon.textContent = "cloud_off";
-      emptyH3.textContent = "No files here";
-      emptyP.textContent = "Upload files or create a folder to get started";
+      empty.querySelector(".material-icons-round").textContent = "cloud_off";
+      empty.querySelector("h3").textContent = "No files here";
+      empty.querySelector("p").textContent =
+        "Upload files or create a folder to get started";
     }
     return;
   }
-
-  container.classList.remove("hidden");
-  emptyState.classList.add("hidden");
-  grid.innerHTML = sorted.map((item) => createFileCard(item)).join("");
-  attachCardEvents(sorted);
-}
-
-function attachCardEvents(sortedItems) {
-  const cards = document.querySelectorAll("#filesGrid .file-card");
-
-  cards.forEach((card, index) => {
-    const item = sortedItems[index];
-
-    card.addEventListener("dblclick", () => {
-      if (item.type === "folder") fetchFiles(item.path);
-      else openPreview(item);
-    });
-
+  cont.classList.remove("hidden");
+  empty.classList.add("hidden");
+  grid.innerHTML = sorted.map(createFileCard).join("");
+  grid.querySelectorAll(".file-card").forEach((card, i) => {
+    const item = sorted[i];
+    card.addEventListener("dblclick", () =>
+      item.type === "folder" ? fetchFiles(item.path) : openPreview(item),
+    );
     card.addEventListener("click", (e) => {
       if (e.target.closest(".btn-more")) return;
-      document
+      grid
         .querySelectorAll(".file-card")
         .forEach((c) => c.classList.remove("selected"));
       card.classList.add("selected");
     });
-
     card.addEventListener("contextmenu", (e) => {
       e.preventDefault();
-      showContextMenu(e, item);
+      showCtxMenu(e, item);
     });
-
-    const moreBtn = card.querySelector(".btn-more");
-    if (moreBtn) {
-      moreBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        showContextMenu(e, item);
-      });
-    }
+    card.querySelector(".btn-more").addEventListener("click", (e) => {
+      e.stopPropagation();
+      showCtxMenu(e, item);
+    });
   });
 }
 
-/* ═══════════════════════════════════════
-   RENDER — Headers & Breadcrumb
-   ═══════════════════════════════════════ */
+/* ═══════════════════════════════════════════
+   RENDER — Collections List
+═══════════════════════════════════════════ */
+async function openCollectionsView() {
+  currentView = "collections";
+  currentPath = "";
+  currentCollection = null;
+  setNav("navCollections");
+  showToolbar("collections");
+  renderViewHeader("Collections", "photo_library", 0);
 
-function renderBreadcrumb() {
-  const bc = document.getElementById("breadcrumb");
+  const grid = $("filesGrid"),
+    cont = $("filesContainer"),
+    empty = $("emptyState");
+  cont.classList.remove("hidden");
+  empty.classList.add("hidden");
+  grid.classList.toggle("list-view", !isGridView);
+  grid.innerHTML = `<div class="loading-state"><span class="material-icons-round">hourglass_empty</span><span>Loading…</span></div>`;
 
-  let html = `
-    <a href="#" class="breadcrumb-item" onclick="fetchFiles(''); return false;">
-      <span class="material-icons-round" style="font-size:18px">home</span> My Files
+  const cols = await apiListCollections();
+  renderViewHeader("Collections", "photo_library", cols.length);
+
+  if (!cols.length) {
+    grid.innerHTML = "";
+    cont.classList.add("hidden");
+    empty.classList.remove("hidden");
+    empty.querySelector(".material-icons-round").textContent = "photo_library";
+    empty.querySelector("h3").textContent = "No collections yet";
+    empty.querySelector("p").textContent =
+      "Create a collection, then add photos from My Files";
+    return;
+  }
+  cont.classList.remove("hidden");
+  empty.classList.add("hidden");
+  grid.innerHTML = cols.map(createColCard).join("");
+  grid.querySelectorAll(".collection-card").forEach((card) => {
+    const col = cols.find((c) => c.id === parseInt(card.dataset.colId));
+    if (!col) return;
+    card.addEventListener("click", (e) => {
+      if (e.target.closest(".btn-more")) return;
+      grid
+        .querySelectorAll(".file-card")
+        .forEach((c) => c.classList.remove("selected"));
+      card.classList.add("selected");
+    });
+    card.addEventListener("dblclick", (e) => {
+      if (!e.target.closest(".btn-more")) openCollectionDetail(col.id);
+    });
+    card.querySelector(".btn-more").addEventListener("click", (e) => {
+      e.stopPropagation();
+      showColCtxMenu(e, col);
+    });
+  });
+}
+
+function createColCard(col) {
+  const cover = col.cover_path
+    ? `<img src="/uploads/${encodeURIComponent(col.cover_path)}" loading="lazy" alt="">`
+    : `<span class="material-icons-round file-icon image" style="font-size:48px">photo_library</span>`;
+  const musicTag = col.music_id
+    ? `<span class="col-music-dot material-icons-round">music_note</span>`
+    : "";
+  return `
+    <div class="file-card collection-card" data-col-id="${col.id}">
+      <div class="card-preview">
+        ${cover}${musicTag}
+        <div class="col-photo-count">${col.item_count} photo${col.item_count !== 1 ? "s" : ""}</div>
+        <div class="col-open-hint"><span class="material-icons-round">open_in_full</span>Open</div>
+      </div>
+      <div class="card-info">
+        <div class="card-name" title="${esc(col.name)}">${esc(col.name)}</div>
+        <div class="card-meta">${col.item_count} photos · ${col.display_time}s · ${col.transition_speed}s trans${col.music_id ? " · 🎵" : ""}</div>
+      </div>
+      <button class="btn-more btn-icon"><span class="material-icons-round">more_vert</span></button>
+    </div>`;
+}
+
+/* ═══════════════════════════════════════════
+   RENDER — Collection Detail
+═══════════════════════════════════════════ */
+async function openCollectionDetail(colId) {
+  currentView = "collectionDetail";
+  setNav("navCollections");
+
+  const grid = $("filesGrid"),
+    cont = $("filesContainer"),
+    empty = $("emptyState");
+  cont.classList.remove("hidden");
+  empty.classList.add("hidden");
+  grid.classList.remove("list-view");
+  grid.innerHTML = `<div class="loading-state"><span class="material-icons-round">hourglass_empty</span><span>Loading…</span></div>`;
+
+  let col;
+  try {
+    col = await apiGetCollection(colId);
+  } catch {
+    showToast("Failed to load", "error");
+    return;
+  }
+  currentCollection = col;
+
+  // Breadcrumb
+  $("breadcrumb").innerHTML = `
+    <a href="#" class="bc-item" onclick="openCollectionsView();return false;">
+      <span class="material-icons-round" style="font-size:18px">photo_library</span>Collections
     </a>
-  `;
+    <span class="material-icons-round bc-sep">chevron_right</span>
+    <span class="bc-item" style="color:var(--text-primary);cursor:default">${esc(col.name)}</span>`;
+  $("fileCount").textContent =
+    `${col.items.length} photo${col.items.length !== 1 ? "s" : ""}`;
 
-  if (currentPath) {
-    const parts = currentPath.split("/").filter(Boolean);
-    let accumulated = "";
-    parts.forEach((part, i) => {
-      accumulated += (accumulated ? "/" : "") + part;
-      const isLast = i === parts.length - 1;
-      const safePath = escapeHtml(accumulated);
-      html += `
-        <span class="material-icons-round breadcrumb-separator">chevron_right</span>
-        <a href="#" class="breadcrumb-item" onclick="fetchFiles('${safePath}'); return false;"
-           ${isLast ? 'style="color:var(--text-primary)"' : ""}>${escapeHtml(part)}</a>
-      `;
+  // Setup toolbar controls
+  showToolbar("collectionDetail");
+  _setupDetailToolbar(col);
+
+  // Render photos
+  if (!col.items.length) {
+    grid.innerHTML = "";
+    cont.classList.add("hidden");
+    empty.classList.remove("hidden");
+    empty.querySelector(".material-icons-round").textContent =
+      "add_photo_alternate";
+    empty.querySelector("h3").textContent = "No photos yet";
+    empty.querySelector("p").textContent =
+      "Go to My Files, right-click an image → Add to Collection";
+    return;
+  }
+  cont.classList.remove("hidden");
+  empty.classList.add("hidden");
+  grid.innerHTML = col.items
+    .map(
+      (item, i) => `
+    <div class="file-card col-photo-card" data-idx="${i}" data-path="${esc(item.file_path)}">
+      <div class="card-preview">
+        <img src="/uploads/${encodeURIComponent(item.file_path)}" loading="lazy" alt="">
+        <div class="col-photo-order">${i + 1}</div>
+        <button class="col-photo-remove btn-icon" title="Remove from collection">
+          <span class="material-icons-round">remove_circle</span>
+        </button>
+      </div>
+      <div class="card-info">
+        <div class="card-name" title="${esc(item.file_name)}">${esc(item.file_name)}</div>
+      </div>
+    </div>`,
+    )
+    .join("");
+
+  grid.querySelectorAll(".col-photo-card").forEach((card, i) => {
+    const item = col.items[i];
+    card.addEventListener("click", (e) => {
+      if (e.target.closest(".col-photo-remove")) return;
+      grid
+        .querySelectorAll(".file-card")
+        .forEach((c) => c.classList.remove("selected"));
+      card.classList.add("selected");
+    });
+    card.addEventListener("dblclick", (e) => {
+      if (!e.target.closest(".col-photo-remove")) openSlideshow(col.id, i);
+    });
+    card
+      .querySelector(".col-photo-remove")
+      .addEventListener("click", async (e) => {
+        e.stopPropagation();
+        if (!confirm(`Remove "${item.file_name}" from this collection?`))
+          return;
+        try {
+          await apiRemoveImageFromCol(col.id, item.file_path);
+          showToast("Removed");
+          openCollectionDetail(col.id);
+        } catch {
+          showToast("Failed", "error");
+        }
+      });
+  });
+}
+
+function _setupDetailToolbar(col) {
+  const transSlider = $("colDetailTransSpeed"),
+    transVal = $("colDetailTransVal");
+  const timeSlider = $("colDetailDispTime"),
+    timeVal = $("colDetailTimeVal");
+
+  transSlider.value = col.transition_speed || 1.0;
+  transVal.textContent = (col.transition_speed || 1.0).toFixed(1) + "s";
+  timeSlider.value = col.display_time || 5;
+  timeVal.textContent = (col.display_time || 5) + "s";
+
+  // Music radio
+  const musicVal = col.music_id || 0;
+  document.querySelectorAll('input[name="colMusic"]').forEach((r) => {
+    r.checked = parseInt(r.value) === musicVal;
+  });
+
+  const saveSettings = debounce(async () => {
+    if (!currentCollection) return;
+    try {
+      const updated = await apiUpdateCollection(currentCollection.id, {
+        transition_speed: parseFloat(transSlider.value),
+        display_time: parseInt(timeSlider.value),
+        music_id:
+          parseInt(
+            document.querySelector('input[name="colMusic"]:checked')?.value ||
+              "0",
+          ) || null,
+      });
+      currentCollection.transition_speed = updated.transition_speed;
+      currentCollection.display_time = updated.display_time;
+      currentCollection.music_id = updated.music_id;
+    } catch {}
+  }, 700);
+
+  transSlider.oninput = function () {
+    transVal.textContent = parseFloat(this.value).toFixed(1) + "s";
+    saveSettings();
+  };
+  timeSlider.oninput = function () {
+    timeVal.textContent = this.value + "s";
+    saveSettings();
+  };
+  document.querySelectorAll('input[name="colMusic"]').forEach((r) => {
+    r.onchange = saveSettings;
+  });
+
+  $("colDetailPlayBtn").onclick = () => openSlideshow(col.id, 0);
+}
+
+/* ═══════════════════════════════════════════
+   CONTEXT MENUS
+═══════════════════════════════════════════ */
+function showCtxMenu(e, item) {
+  contextFile = item;
+  hideAddToColMenu();
+  const menu = $("contextMenu"),
+    inner = menu.querySelector(".ctx-menu-inner");
+  inner.innerHTML = `
+    <button class="ctx-item" data-action="open"><span class="material-icons-round">open_in_new</span>Open</button>
+    <button class="ctx-item" data-action="download"><span class="material-icons-round">download</span>Download</button>
+    <button class="ctx-item" data-action="star">
+      <span class="material-icons-round">${item.is_starred ? "star" : "star_outline"}</span>${item.is_starred ? "Unstar" : "Star"}
+    </button>
+    ${
+      item.file_type === "image"
+        ? `
+    <div class="ctx-sep"></div>
+    <button class="ctx-item" data-action="addtocol">
+      <span class="material-icons-round">add_photo_alternate</span>Add to Collection
+      <span class="material-icons-round" style="font-size:14px;margin-left:auto;opacity:.5">chevron_right</span>
+    </button>`
+        : ""
+    }
+    <div class="ctx-sep"></div>
+    <button class="ctx-item" data-action="rename"><span class="material-icons-round">drive_file_rename_outline</span>Rename</button>
+    <button class="ctx-item danger" data-action="delete"><span class="material-icons-round">delete_outline</span>Delete</button>`;
+  inner
+    .querySelectorAll(".ctx-item[data-action]")
+    .forEach((b) =>
+      b.addEventListener("click", () => handleCtxAction(b.dataset.action, e)),
+    );
+  positionMenu(menu, e);
+}
+
+function showColCtxMenu(e, col) {
+  contextFile = null;
+  const menu = $("contextMenu"),
+    inner = menu.querySelector(".ctx-menu-inner");
+  inner.innerHTML = `
+    <button class="ctx-item" id="ctxOpen"><span class="material-icons-round">folder_open</span>Open</button>
+    <button class="ctx-item" id="ctxPlay"><span class="material-icons-round">play_arrow</span>Play Slideshow</button>
+    <div class="ctx-sep"></div>
+    <button class="ctx-item danger" id="ctxDel"><span class="material-icons-round">delete_outline</span>Delete</button>`;
+  inner.querySelector("#ctxOpen").onclick = () => {
+    hideCtxMenu();
+    openCollectionDetail(col.id);
+  };
+  inner.querySelector("#ctxPlay").onclick = () => {
+    hideCtxMenu();
+    openSlideshow(col.id, 0);
+  };
+  inner.querySelector("#ctxDel").onclick = () => {
+    hideCtxMenu();
+    if (confirm(`Delete "${col.name}"? All photos stay in My Files.`))
+      apiDeleteCollection(col.id)
+        .then(() => {
+          showToast("Deleted");
+          openCollectionsView();
+        })
+        .catch(() => showToast("Failed", "error"));
+  };
+  positionMenu(menu, e);
+}
+
+function showAddToColSubmenu(filePath, anchorEl) {
+  const sub = $("addToColMenu"),
+    inner = $("addToColInner");
+  if (!collections.length) {
+    inner.innerHTML = `<div class="ctx-empty">No collections yet.<br>Create one first.</div>`;
+  } else {
+    inner.innerHTML = collections
+      .map(
+        (col) => `
+      <button class="ctx-item" data-col-id="${col.id}">
+        <span class="material-icons-round">photo_library</span>
+        ${esc(col.name)}
+        <span class="ctx-count">${col.item_count}</span>
+      </button>`,
+      )
+      .join("");
+    inner.querySelectorAll(".ctx-item[data-col-id]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        hideCtxMenu();
+        hideAddToColMenu();
+        const colId = parseInt(btn.dataset.colId);
+        try {
+          const res = await apiAddImageToCol(colId, filePath);
+          const col = collections.find((c) => c.id === colId);
+          showToast(`Added to "${col?.name || "Collection"}"`);
+          // Update local count
+          if (col) col.item_count = (col.item_count || 0) + 1;
+          updateColBadge();
+        } catch (err) {
+          showToast(err.message || "Failed", "error");
+        }
+      });
     });
   }
-
-  bc.innerHTML = html;
+  // Position sub-menu to the right of anchor
+  const rect = anchorEl.getBoundingClientRect();
+  sub.classList.remove("hidden");
+  sub.style.left = rect.right + 4 + "px";
+  sub.style.top = rect.top + "px";
 }
 
-function renderViewHeader(title, icon, count) {
-  const bc = document.getElementById("breadcrumb");
-  bc.innerHTML = `
-    <span class="breadcrumb-item" style="color:var(--text-primary); cursor:default;">
-      <span class="material-icons-round" style="font-size:18px">${icon}</span> ${escapeHtml(title)}
-    </span>
-  `;
-  document.getElementById("fileCount").textContent =
-    `${count} item${count !== 1 ? "s" : ""}`;
+function hideAddToColMenu() {
+  $("addToColMenu").classList.add("hidden");
 }
 
-function updateToolbarVisibility() {
-  const toolbar = document.getElementById("toolbar");
-  toolbar.style.display = currentView === "files" ? "flex" : "none";
-}
-
-/* ═══════════════════════════════════════
-   SIDEBAR — Nav
-   ═══════════════════════════════════════ */
-
-function setActiveNav(activeId) {
-  document
-    .querySelectorAll(".nav-item")
-    .forEach((n) => n.classList.remove("active"));
-  const el = document.getElementById(activeId);
-  if (el) el.classList.add("active");
-}
-
-/* ═══════════════════════════════════════
-   CONTEXT MENU
-   ═══════════════════════════════════════ */
-
-function showContextMenu(e, item) {
-  contextFile = item;
-  const menu = document.getElementById("contextMenu");
-  const menuInner = menu.querySelector(".ctx-menu-inner");
-
-  const starIcon = item.is_starred ? "star" : "star_outline";
-  const starLabel = item.is_starred ? "Unstar" : "Star";
-
-  menuInner.innerHTML = `
-    <button class="ctx-item" data-action="open">
-      <span class="material-icons-round">open_in_new</span> <span>Open</span>
-    </button>
-    <button class="ctx-item" data-action="download">
-      <span class="material-icons-round">download</span> <span>Download</span>
-    </button>
-    <button class="ctx-item" data-action="star">
-      <span class="material-icons-round">${starIcon}</span> <span>${starLabel}</span>
-    </button>
-    <button class="ctx-item" data-action="rename">
-      <span class="material-icons-round">drive_file_rename_outline</span> <span>Rename</span>
-    </button>
-    <div class="ctx-separator"></div>
-    <button class="ctx-item danger" data-action="delete">
-      <span class="material-icons-round">delete_outline</span> <span>Delete</span>
-    </button>
-  `;
-
-  menuInner.querySelectorAll(".ctx-item").forEach((btn) => {
-    btn.addEventListener("click", () =>
-      handleContextAction(btn.dataset.action),
-    );
-  });
-
+function positionMenu(menu, e) {
   menu.classList.remove("hidden");
-  const x = Math.min(e.clientX, window.innerWidth - 220);
-  const y = Math.min(e.clientY, window.innerHeight - 260);
-  menu.style.left = x + "px";
-  menu.style.top = y + "px";
+  menu.style.left = Math.min(e.clientX, window.innerWidth - 220) + "px";
+  menu.style.top = Math.min(e.clientY, window.innerHeight - 300) + "px";
 }
 
-function hideContextMenu() {
-  document.getElementById("contextMenu").classList.add("hidden");
+function hideCtxMenu() {
+  $("contextMenu").classList.add("hidden");
+  hideAddToColMenu();
   contextFile = null;
 }
 
-function handleContextAction(action) {
-  if (!contextFile) return;
-
+function handleCtxAction(action, origEvent) {
+  const item = contextFile;
+  if (action !== "addtocol") hideCtxMenu();
+  if (!item) return;
   switch (action) {
     case "open":
-      if (contextFile.type === "folder") fetchFiles(contextFile.path);
-      else openPreview(contextFile);
+      item.type === "folder" ? fetchFiles(item.path) : openPreview(item);
       break;
-
-    case "download":
+    case "download": {
       const a = document.createElement("a");
-      a.href = `/api/download/${encodeURIComponent(contextFile.path)}`;
-      a.download = contextFile.name;
+      a.href = `/api/download/${encodeURIComponent(item.path)}`;
+      a.download = item.name;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       break;
-
+    }
     case "star":
-      apiToggleStar(contextFile.path);
+      apiStar(item.path);
       break;
-
+    case "addtocol": {
+      // Show sub-menu anchored to the "Add to Collection" button
+      const btn = $("contextMenu").querySelector('[data-action="addtocol"]');
+      if (btn) showAddToColSubmenu(item.path, btn);
+      break;
+    }
     case "rename":
-      showRenameDialog(contextFile);
+      showRenameDialog(item);
       break;
-
     case "delete":
-      if (confirm(`Delete "${contextFile.name}"? This cannot be undone.`)) {
-        apiDelete(contextFile.path);
-      }
+      if (confirm(`Delete "${item.name}"? Cannot be undone.`))
+        apiDelete(item.path);
       break;
   }
-
-  hideContextMenu();
 }
 
-/* ═══════════════════════════════════════
-   DRAG & DROP, SEARCH, PREVIEW, MODALS
-   ═══════════════════════════════════════ */
+/* ═══════════════════════════════════════════
+   COLLECTION MANAGEMENT
+═══════════════════════════════════════════ */
+function showNewCollectionDialog() {
+  $("newColNameInput").value = "";
+  $("newCollectionModal").classList.remove("hidden");
+  setTimeout(() => $("newColNameInput").focus(), 80);
+}
 
+async function submitNewCollection() {
+  const name = $("newColNameInput").value.trim();
+  if (!name) {
+    showToast("Enter a name", "error");
+    return;
+  }
+  const btn = $("newColCreateBtn");
+  btn.disabled = true;
+  try {
+    await apiCreateColFolder(name);
+    await apiListCollections();
+    closeModal("newCollectionModal");
+    showToast(`Collection "${name}" created`);
+    openCollectionsView();
+  } catch (e) {
+    showToast(e.message || "Failed", "error");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ═══════════════════════════════════════════
+   SLIDESHOW PLAYER
+═══════════════════════════════════════════ */
+async function openSlideshow(colId, startIdx = 0) {
+  let col;
+  try {
+    col = await apiGetCollection(colId);
+  } catch {
+    showToast("Failed to load slideshow", "error");
+    return;
+  }
+  if (!col.items?.length) {
+    showToast("No photos in this collection", "error");
+    return;
+  }
+
+  ssStop();
+  if (ss.audio) {
+    ss.audio.pause();
+    ss.audio = null;
+  }
+
+  ss = {
+    items: col.items,
+    idx: Math.max(0, Math.min(startIdx, col.items.length - 1)),
+    playing: false,
+    displayTime: col.display_time || 5,
+    transSpeed: col.transition_speed || 1.0,
+    timer: null,
+    audio: null,
+    colId,
+  };
+
+  // Apply transition speed to CSS
+  document.documentElement.style.setProperty("--ss-trans", ss.transSpeed + "s");
+
+  // Build slides
+  const slidesEl = $("ssSlides");
+  slidesEl.innerHTML = "";
+  col.items.forEach((it, i) => {
+    const div = document.createElement("div");
+    div.className = "ss-slide";
+    div.dataset.idx = i;
+    const img = document.createElement("img");
+    img.src = `/uploads/${encodeURIComponent(it.file_path)}`;
+    img.alt = it.file_name;
+    div.appendChild(img);
+    slidesEl.appendChild(div);
+  });
+
+  // Filmstrip
+  $("ssFilmstrip").innerHTML = col.items
+    .map(
+      (it, i) =>
+        `<img class="ss-film" data-idx="${i}" src="/uploads/${encodeURIComponent(it.file_path)}" loading="lazy" alt="">`,
+    )
+    .join("");
+  $("ssFilmstrip")
+    .querySelectorAll(".ss-film")
+    .forEach((t) =>
+      t.addEventListener("click", () => ssGo(parseInt(t.dataset.idx))),
+    );
+
+  // Music
+  if (col.music_id && MUSIC_TRACKS[col.music_id]) {
+    ss.audio = new Audio(MUSIC_TRACKS[col.music_id].src);
+    ss.audio.loop = true;
+    ss.audio.volume = 0.55;
+    $("ssMusicTagName").textContent = MUSIC_TRACKS[col.music_id].name;
+    $("ssMusicTag").classList.remove("hidden");
+    $("ssVolCtrl").classList.remove("hidden");
+  } else {
+    $("ssMusicTag").classList.add("hidden");
+    $("ssVolCtrl").classList.add("hidden");
+  }
+
+  $("ssVolSlider").value = 55;
+  $("ssTitle").textContent = col.name;
+  $("ssPlayer").classList.remove("hidden");
+  ssUpdateSlides();
+}
+
+function ssUpdateSlides() {
+  const slides = $("ssSlides").querySelectorAll(".ss-slide");
+  slides.forEach((s, i) => {
+    const d = i - ss.idx;
+    s.className = "ss-slide";
+    if (d === 0) s.classList.add("ss-curr");
+    else if (d === -1) s.classList.add("ss-prev");
+    else if (d === 1) s.classList.add("ss-next");
+    else if (d < -1) s.classList.add("ss-offl");
+    else s.classList.add("ss-offr");
+  });
+  $("ssFilmstrip")
+    .querySelectorAll(".ss-film")
+    .forEach((t, i) => t.classList.toggle("active", i === ss.idx));
+  $("ssFilmstrip")
+    .querySelector(".ss-film.active")
+    ?.scrollIntoView({
+      behavior: "smooth",
+      inline: "center",
+      block: "nearest",
+    });
+  const n = ss.items.length;
+  $("ssCounter").textContent = `${ss.idx + 1} / ${n}`;
+  $("ssProgressPos").style.width = (n > 1 ? (ss.idx / (n - 1)) * 100 : 0) + "%";
+}
+
+function ssGo(idx) {
+  ss.idx = Math.max(0, Math.min(ss.items.length - 1, idx));
+  ssUpdateSlides();
+  if (ss.playing) {
+    ssStop();
+    ssStartAuto();
+  }
+}
+function ssNav(dir) {
+  ssGo((ss.idx + dir + ss.items.length) % ss.items.length);
+}
+
+function ssPlay() {
+  ss.playing = true;
+  $("ssPlayIcon").textContent = "pause";
+  if (ss.audio) ss.audio.play().catch(() => {});
+  ssStartAuto();
+}
+function ssPause() {
+  ss.playing = false;
+  $("ssPlayIcon").textContent = "play_arrow";
+  if (ss.audio) ss.audio.pause();
+  ssStop();
+  const ab = $("ssProgressAuto");
+  ab.style.transition = "none";
+  ab.style.width = "0%";
+}
+function ssTogglePlay() {
+  ss.playing ? ssPause() : ssPlay();
+}
+
+function ssStartAuto() {
+  ssStop();
+  const ab = $("ssProgressAuto");
+  ab.style.transition = "none";
+  ab.style.width = "0%";
+  void ab.offsetHeight;
+  ab.style.transition = `width ${ss.displayTime}s linear`;
+  ab.style.width = "100%";
+  ss.timer = setTimeout(() => {
+    if (ss.playing) {
+      ssNav(1);
+      ssStartAuto();
+    }
+  }, ss.displayTime * 1000);
+}
+function ssStop() {
+  clearTimeout(ss.timer);
+  ss.timer = null;
+}
+
+function closeSlideshow() {
+  ssPause();
+  ss.audio = null;
+  $("ssPlayer").classList.add("hidden");
+}
+
+/* ═══════════════════════════════════════════
+   HEADERS & TOOLBARS
+═══════════════════════════════════════════ */
+function renderBreadcrumb() {
+  const bc = $("breadcrumb");
+  let html = `<a href="#" class="bc-item" onclick="fetchFiles('');return false;"><span class="material-icons-round" style="font-size:18px">home</span>My Files</a>`;
+  if (currentPath) {
+    const parts = currentPath.split("/").filter(Boolean);
+    let acc = "";
+    parts.forEach((p, i) => {
+      acc += (acc ? "/" : "") + p;
+      const safe = esc(acc),
+        last = i === parts.length - 1;
+      html += `<span class="material-icons-round bc-sep">chevron_right</span>
+        <a href="#" class="bc-item" onclick="fetchFiles('${safe}');return false;" ${last ? 'style="color:var(--text-primary)"' : ""}>${esc(p)}</a>`;
+    });
+  }
+  bc.innerHTML = html;
+}
+
+function renderViewHeader(title, icon, count) {
+  $("breadcrumb").innerHTML =
+    `<span class="bc-item" style="color:var(--text-primary);cursor:default">
+    <span class="material-icons-round" style="font-size:18px">${icon}</span>${esc(title)}</span>`;
+  $("fileCount").textContent = `${count} item${count !== 1 ? "s" : ""}`;
+}
+
+function showToolbar(view) {
+  $("toolbar").style.display = view === "files" ? "flex" : "none";
+  $("toolbarCollections").classList.toggle("hidden", view !== "collections");
+  $("toolbarColDetail").classList.toggle("hidden", view !== "collectionDetail");
+}
+
+function setNav(id) {
+  document
+    .querySelectorAll(".nav-item")
+    .forEach((n) => n.classList.remove("active"));
+  $(id)?.classList.add("active");
+}
+
+function updateColBadge() {
+  const b = $("colsBadge");
+  if (!b) return;
+  b.textContent = collections.length;
+  b.classList.toggle("hidden", collections.length === 0);
+}
+
+function updateFileCount() {
+  const fld = currentFiles.filter((f) => f.type === "folder").length;
+  const fil = currentFiles.filter((f) => f.type !== "folder").length;
+  const p = [];
+  if (fld) p.push(`${fld} folder${fld > 1 ? "s" : ""}`);
+  if (fil) p.push(`${fil} file${fil > 1 ? "s" : ""}`);
+  $("fileCount").textContent = p.join(", ") || "Empty";
+}
+
+function updateStorage(s) {
+  if (!s) return;
+  $("storageFill").style.width = Math.min((s.used / s.total) * 100, 100) + "%";
+  $("storageText").textContent =
+    `${fmtSize(s.used)} of ${fmtSize(s.total)} used`;
+}
+
+function sortFiles(key) {
+  currentSort =
+    currentSort.key === key
+      ? { key, asc: !currentSort.asc }
+      : { key, asc: true };
+  renderFiles();
+}
+
+function toggleView() {
+  isGridView = !isGridView;
+  $("viewIcon").textContent = isGridView ? "grid_view" : "view_list";
+  currentView === "collections" ? openCollectionsView() : renderFiles();
+}
+
+/* ═══════════════════════════════════════════
+   MODALS
+═══════════════════════════════════════════ */
+function closeModal(id) {
+  $(id).classList.add("hidden");
+}
+
+function showNewFolderDialog() {
+  $("folderNameInput").value = "";
+  $("folderModal").classList.remove("hidden");
+  setTimeout(() => $("folderNameInput").focus(), 80);
+}
+function createFolder() {
+  const n = $("folderNameInput").value.trim();
+  if (!n) {
+    showToast("Enter a name", "error");
+    return;
+  }
+  apiCreateFolder(n);
+  closeModal("folderModal");
+}
+
+function showRenameDialog(item) {
+  renameTarget = item;
+  const inp = $("renameInput");
+  inp.value = item.name;
+  $("renameModal").classList.remove("hidden");
+  setTimeout(() => {
+    inp.focus();
+    const dot = item.name.lastIndexOf(".");
+    if (dot > 0 && item.type !== "folder") inp.setSelectionRange(0, dot);
+    else inp.select();
+  }, 80);
+}
+function renameFile() {
+  const n = $("renameInput").value.trim();
+  if (!n || !renameTarget) return;
+  apiRename(renameTarget.path, n);
+  renameTarget = null;
+  closeModal("renameModal");
+}
+
+async function openPreview(item) {
+  $("previewTitle").textContent = item.name;
+  const body = $("previewBody");
+  body.innerHTML = `<p style="color:var(--text-tertiary)">Loading…</p>`;
+  $("previewModal").classList.remove("hidden");
+  const url = `/uploads/${encodeURIComponent(item.path)}`;
+  switch (item.file_type) {
+    case "image":
+      body.innerHTML = `<img src="${url}" class="preview-img">`;
+      break;
+    case "video":
+      body.innerHTML = `<video src="${url}" controls autoplay style="max-width:100%;max-height:65vh;border-radius:8px"></video>`;
+      break;
+    case "audio":
+      body.innerHTML = `<div style="text-align:center;padding:40px"><span class="material-icons-round" style="font-size:64px;color:var(--color-audio)">audiotrack</span><p style="margin:16px 0">${esc(item.name)}</p><audio src="${url}" controls autoplay style="width:100%;max-width:400px"></audio></div>`;
+      break;
+    case "code": {
+      const d = await apiPreview(item.path);
+      body.innerHTML = d?.content
+        ? `<pre class="preview-code">${esc(d.content)}</pre>`
+        : previewFallback(item, url);
+      break;
+    }
+    case "pdf":
+      body.innerHTML = `<iframe src="${url}" style="width:100%;height:70vh;border:none;border-radius:8px"></iframe>`;
+      break;
+    default:
+      body.innerHTML = previewFallback(item, url);
+  }
+}
+
+function previewFallback(item, url) {
+  const ic = FILE_ICONS[item.file_type] || FILE_ICONS.default;
+  return `<div style="text-align:center;padding:40px">
+    <span class="material-icons-round file-icon ${ic.css}" style="font-size:72px">${ic.icon}</span>
+    <p style="margin:16px 0;font-weight:500">${esc(item.name)}</p>
+    <p style="color:var(--text-tertiary);margin-bottom:20px">${fmtSize(item.size)}</p>
+    <a href="${url}" download="${esc(item.name)}" style="display:inline-flex;align-items:center;gap:8px;padding:10px 24px;background:var(--accent);color:#fff;border-radius:var(--r-md);text-decoration:none;font-weight:600">
+      <span class="material-icons-round" style="font-size:20px">download</span>Download</a></div>`;
+}
+
+/* ═══════════════════════════════════════════
+   TOAST
+═══════════════════════════════════════════ */
+function showToast(msg, type = "success") {
+  const c = $("toastContainer"),
+    t = document.createElement("div");
+  t.className = `toast ${type}`;
+  t.innerHTML = `<span class="material-icons-round" style="font-size:18px">${type === "success" ? "check_circle" : "error_outline"}</span><span>${esc(msg)}</span>`;
+  c.appendChild(t);
+  setTimeout(() => t.remove(), 3000);
+}
+
+/* ═══════════════════════════════════════════
+   DRAG & DROP / SEARCH / KEYBOARD
+═══════════════════════════════════════════ */
 function setupDragDrop() {
-  const overlay = document.getElementById("dropOverlay");
+  const ov = $("dropOverlay");
   document.addEventListener("dragenter", (e) => {
     e.preventDefault();
     dragCounter++;
-    overlay.classList.add("visible");
+    ov.classList.add("visible");
   });
   document.addEventListener("dragleave", (e) => {
     e.preventDefault();
-    dragCounter--;
-    if (dragCounter === 0) overlay.classList.remove("visible");
+    if (--dragCounter === 0) ov.classList.remove("visible");
   });
   document.addEventListener("dragover", (e) => e.preventDefault());
   document.addEventListener("drop", (e) => {
     e.preventDefault();
     dragCounter = 0;
-    overlay.classList.remove("visible");
-    if (e.dataTransfer.files.length > 0) apiUpload(e.dataTransfer.files);
+    ov.classList.remove("visible");
+    if (e.dataTransfer.files.length) apiUpload(e.dataTransfer.files);
   });
 }
 
 function setupSearch() {
-  const input = document.getElementById("searchInput");
-  input.addEventListener("input", () => {
+  $("searchInput").addEventListener("input", () => {
     clearTimeout(searchTimeout);
-    const query = input.value.trim();
-    if (!query) {
-      refreshCurrentView();
+    const q = $("searchInput").value.trim();
+    if (!q) {
+      refreshView();
       return;
     }
     searchTimeout = setTimeout(async () => {
-      const data = await apiSearch(query);
-      currentFiles = data.results || [];
+      const results = await doSearch(q);
+      currentFiles = results;
       renderFiles();
-      document.getElementById("fileCount").textContent =
-        `${currentFiles.length} result(s)`;
+      $("fileCount").textContent = `${results.length} result(s)`;
     }, 300);
   });
 }
 
-async function openPreview(item) {
-  const modal = document.getElementById("previewModal");
-  const title = document.getElementById("previewTitle");
-  const body = document.getElementById("previewBody");
-
-  title.textContent = item.name;
-  body.innerHTML = `<p style="color:var(--text-tertiary)">Loading...</p>`;
-  modal.classList.remove("hidden");
-
-  const fileUrl = `/uploads/${encodeURIComponent(item.path)}`;
-
-  switch (item.file_type) {
-    case "image":
-      body.innerHTML = `<img src="${fileUrl}" alt="${escapeHtml(item.name)}" class="preview-image">`;
-      break;
-    case "video":
-      body.innerHTML = `<video src="${fileUrl}" controls autoplay style="max-width:100%;max-height:65vh;border-radius:8px;"></video>`;
-      break;
-    case "audio":
-      body.innerHTML = `<div style="text-align:center;padding:40px;">
-        <span class="material-icons-round" style="font-size:64px;color:var(--color-audio);">audiotrack</span>
-        <p style="margin:16px 0;color:var(--text-secondary);">${escapeHtml(item.name)}</p>
-        <audio src="${fileUrl}" controls autoplay style="width:100%;max-width:400px;"></audio>
-      </div>`;
-      break;
-    case "code":
-      const data = await apiPreview(item.path);
-      if (data && data.content)
-        body.innerHTML = `<pre class="preview-code">${escapeHtml(data.content)}</pre>`;
-      else body.innerHTML = defaultPreviewHtml(item, fileUrl);
-      break;
-    case "pdf":
-      body.innerHTML = `<iframe src="${fileUrl}" style="width:100%;height:70vh;border:none;border-radius:8px;"></iframe>`;
-      break;
-    default:
-      body.innerHTML = defaultPreviewHtml(item, fileUrl);
-  }
-}
-
-function defaultPreviewHtml(item, fileUrl) {
-  const iconData = FILE_ICONS[item.file_type] || FILE_ICONS.default;
-  return `<div style="text-align:center;padding:40px;">
-    <span class="material-icons-round file-icon ${iconData.css}" style="font-size:72px;">${iconData.icon}</span>
-    <p style="margin:16px 0;font-weight:500;">${escapeHtml(item.name)}</p>
-    <p style="color:var(--text-tertiary);margin-bottom:20px;">${formatSize(item.size)}</p>
-    <a href="${fileUrl}" download="${escapeHtml(item.name)}"
-      style="display:inline-flex;align-items:center;gap:8px;padding:10px 24px;background:var(--accent);color:white;border-radius:var(--radius-md);text-decoration:none;font-weight:600;">
-      <span class="material-icons-round" style="font-size:20px;">download</span> Download
-    </a>
-  </div>`;
-}
-
-function closeModal(modalId) {
-  document.getElementById(modalId).classList.add("hidden");
-}
-
-function showNewFolderDialog() {
-  const input = document.getElementById("folderNameInput");
-  input.value = "";
-  document.getElementById("folderModal").classList.remove("hidden");
-  setTimeout(() => input.focus(), 100);
-}
-
-function createFolder() {
-  const name = document.getElementById("folderNameInput").value.trim();
-  if (!name) {
-    showToast("Please enter a folder name", "error");
-    return;
-  }
-  apiCreateFolder(name);
-  closeModal("folderModal");
-}
-
-function showRenameDialog(item) {
-  const input = document.getElementById("renameInput");
-  input.value = item.name;
-  document.getElementById("renameModal").classList.remove("hidden");
-  setTimeout(() => {
-    input.focus();
-    const dotIndex = item.name.lastIndexOf(".");
-    if (dotIndex > 0 && item.type !== "folder")
-      input.setSelectionRange(0, dotIndex);
-    else input.select();
-  }, 100);
-}
-
-function renameFile() {
-  const newName = document.getElementById("renameInput").value.trim();
-  if (!newName) {
-    showToast("Please enter a name", "error");
-    return;
-  }
-  if (!contextFile) return;
-  apiRename(contextFile.path, newName);
-  closeModal("renameModal");
-}
-
-function sortFiles(key) {
-  if (currentSort.key === key) currentSort.asc = !currentSort.asc;
-  else currentSort = { key, asc: true };
-  renderFiles();
-}
-
-/* ═══════════════════════════════════════
-   UI HELPERS
-   ═══════════════════════════════════════ */
-
-function showToast(message, type = "success") {
-  const container = document.getElementById("toastContainer");
-  const toast = document.createElement("div");
-  toast.className = `toast ${type}`;
-  const icons = { success: "check_circle", error: "error_outline" };
-  toast.innerHTML = `
-    <span class="material-icons-round" style="font-size:20px;">${icons[type] || "info"}</span>
-    <span>${escapeHtml(message)}</span>
-  `;
-  container.appendChild(toast);
-  setTimeout(() => toast.remove(), 3000);
-}
-
-function updateFileCount() {
-  const el = document.getElementById("fileCount");
-  const folders = currentFiles.filter((f) => f.type === "folder").length;
-  const files = currentFiles.filter((f) => f.type !== "folder").length;
-  const parts = [];
-  if (folders) parts.push(`${folders} folder${folders > 1 ? "s" : ""}`);
-  if (files) parts.push(`${files} file${files > 1 ? "s" : ""}`);
-  el.textContent = parts.join(", ") || "Empty";
-}
-
-function updateStorage(storage) {
-  if (!storage) return;
-  const fill = document.getElementById("storageFill");
-  const text = document.getElementById("storageText");
-  const pct = Math.min((storage.used / storage.total) * 100, 100);
-  fill.style.width = pct + "%";
-  text.textContent = `${formatSize(storage.used)} of ${formatSize(storage.total)} used`;
-}
-
-function toggleView() {
-  isGridView = !isGridView;
-  document.getElementById("viewIcon").textContent = isGridView
-    ? "grid_view"
-    : "view_list";
-  renderFiles();
-}
-
 function setupKeyboard() {
   document.addEventListener("keydown", (e) => {
+    if (!$("ssPlayer").classList.contains("hidden")) {
+      if (e.key === "Escape") closeSlideshow();
+      if (e.key === "ArrowLeft") ssNav(-1);
+      if (e.key === "ArrowRight") ssNav(1);
+      if (e.key === " ") {
+        e.preventDefault();
+        ssTogglePlay();
+      }
+      return;
+    }
     if (e.key === "Escape") {
-      closeModal("previewModal");
-      closeModal("folderModal");
-      closeModal("renameModal");
-      hideContextMenu();
+      [
+        "previewModal",
+        "folderModal",
+        "renameModal",
+        "newCollectionModal",
+      ].forEach(closeModal);
+      hideCtxMenu();
     }
     if (e.key === "Backspace" && !isTyping()) {
       e.preventDefault();
+      if (currentView === "collectionDetail") {
+        openCollectionsView();
+        return;
+      }
       if (currentView !== "files") {
         fetchFiles("");
         return;
       }
       if (currentPath) {
-        const parts = currentPath.split("/").filter(Boolean);
-        parts.pop();
-        fetchFiles(parts.join("/"));
+        const p = currentPath.split("/").filter(Boolean);
+        p.pop();
+        fetchFiles(p.join("/"));
       }
     }
     if (e.key === "Enter" && !isTyping()) {
-      const selected = document.querySelector(".file-card.selected");
-      if (selected) {
-        const path = selected.dataset.path;
-        const item = currentFiles.find((f) => f.path === path);
-        if (item) {
-          if (item.type === "folder") fetchFiles(item.path);
-          else openPreview(item);
-        }
+      const sel = document.querySelector(".file-card.selected");
+      if (!sel) return;
+      if (currentView === "collections") {
+        const colId = parseInt(sel.dataset.colId);
+        if (colId) openCollectionDetail(colId);
+      } else if (currentView === "files") {
+        const item = currentFiles.find((f) => f.path === sel.dataset.path);
+        if (item)
+          item.type === "folder" ? fetchFiles(item.path) : openPreview(item);
       }
     }
   });
 }
 
-function setupMobile() {
-  const menuBtn = document.getElementById("mobileMenu");
-  const sidebar = document.getElementById("sidebar");
-  menuBtn.addEventListener("click", () => sidebar.classList.toggle("open"));
+/* ═══════════════════════════════════════════
+   INIT
+═══════════════════════════════════════════ */
+document.addEventListener("DOMContentLoaded", () => {
+  $("fileInput").addEventListener("change", (e) => {
+    if (e.target.files.length) apiUpload(e.target.files);
+    e.target.value = "";
+  });
+  $("toggleView").addEventListener("click", toggleView);
+
+  // Close menus on outside click
+  document.addEventListener("click", (e) => {
+    if (
+      !e.target.closest("#contextMenu") &&
+      !e.target.closest(".btn-more") &&
+      !e.target.closest("#addToColMenu")
+    )
+      hideCtxMenu();
+  });
+
+  // Modal backdrop clicks
+  ["previewModal", "folderModal", "renameModal", "newCollectionModal"].forEach(
+    (id) => {
+      $(id)?.addEventListener("click", (e) => {
+        if (e.target === e.currentTarget) closeModal(id);
+      });
+    },
+  );
+
+  // Enter keys in inputs
+  $("folderNameInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") createFolder();
+  });
+  $("renameInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") renameFile();
+  });
+  $("newColNameInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") submitNewCollection();
+  });
+
+  // Slideshow controls
+  $("ssBtnClose").addEventListener("click", closeSlideshow);
+  $("ssBtnPlay").addEventListener("click", ssTogglePlay);
+  $("ssBtnPrev").addEventListener("click", () => ssNav(-1));
+  $("ssBtnNext").addEventListener("click", () => ssNav(1));
+  $("ssBtnLeft").addEventListener("click", () => ssNav(-1));
+  $("ssBtnRight").addEventListener("click", () => ssNav(1));
+
+  $("ssVolSlider").addEventListener("input", function () {
+    if (ss.audio) ss.audio.volume = parseInt(this.value) / 100;
+  });
+  $("ssProgressTrack").addEventListener("click", (e) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    ssGo(Math.floor(((e.clientX - r.left) / r.width) * ss.items.length));
+  });
+
+  // Auto-hide cursor in player
+  let cursorTimer;
+  $("ssPlayer").addEventListener("mousemove", () => {
+    $("ssPlayer").style.cursor = "";
+    clearTimeout(cursorTimer);
+    cursorTimer = setTimeout(() => {
+      $("ssPlayer").style.cursor = "none";
+    }, 2500);
+  });
+
+  // Mobile sidebar
+  const mobileBtn = $("mobileMenu"),
+    sidebar = $("sidebar");
+  mobileBtn.addEventListener("click", () => sidebar.classList.toggle("open"));
   document.addEventListener("click", (e) => {
     if (
       sidebar.classList.contains("open") &&
       !sidebar.contains(e.target) &&
-      !menuBtn.contains(e.target)
+      !mobileBtn.contains(e.target)
     )
       sidebar.classList.remove("open");
-  });
-}
-
-/* ═══════════════════════════════════════
-   INIT
-   ═══════════════════════════════════════ */
-
-document.addEventListener("DOMContentLoaded", () => {
-  // File input
-  document.getElementById("fileInput").addEventListener("change", (e) => {
-    if (e.target.files.length > 0) apiUpload(e.target.files);
-    e.target.value = "";
-  });
-
-  // View toggle
-  document.getElementById("toggleView").addEventListener("click", toggleView);
-
-  // Click outside context menu
-  document.addEventListener("click", (e) => {
-    if (!e.target.closest("#contextMenu") && !e.target.closest(".btn-more"))
-      hideContextMenu();
-  });
-
-  // Modal backdrop close
-  ["previewModal", "folderModal", "renameModal"].forEach((id) => {
-    const el = document.getElementById(id);
-    if (el)
-      el.addEventListener("click", (e) => {
-        if (e.target === e.currentTarget) closeModal(id);
-      });
-  });
-
-  // Input enter keys
-  document
-    .getElementById("folderNameInput")
-    .addEventListener("keydown", (e) => {
-      if (e.key === "Enter") createFolder();
-    });
-  document.getElementById("renameInput").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") renameFile();
-  });
-
-  // Nav items
-  document.getElementById("navFiles").addEventListener("click", (e) => {
-    e.preventDefault();
-    fetchFiles("");
-  });
-  document.getElementById("navStarred").addEventListener("click", (e) => {
-    e.preventDefault();
-    fetchStarred();
   });
 
   setupDragDrop();
   setupSearch();
   setupKeyboard();
-  setupMobile();
-
-  // Initial load
+  apiListCollections();
   fetchFiles("");
 });
