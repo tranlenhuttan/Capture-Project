@@ -37,6 +37,5 @@ def get_db():
 
 
 def init_db():
-    """Tạo tất cả tables (nếu chưa có)."""
     from models import FileItem  
     Base.metadata.create_all(bind=engine)

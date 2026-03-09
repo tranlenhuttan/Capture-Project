@@ -117,7 +117,6 @@ def sync_file_to_db(filepath: Path, db: Session) -> FileItem:
 
 
 def sync_directory_to_db(dir_path: Path, db: Session):
-    """Đồng bộ level-1 của thư mục với database."""
     if not dir_path.exists() or not dir_path.is_dir():
         return
 
