@@ -929,13 +929,11 @@ function ssUpdateSlides() {
   $("ssFilmstrip")
     .querySelectorAll(".ss-film")
     .forEach((t, i) => t.classList.toggle("active", i === ss.idx));
-  $("ssFilmstrip")
-    .querySelector(".ss-film.active")
-    ?.scrollIntoView({
-      behavior: "smooth",
-      inline: "center",
-      block: "nearest",
-    });
+  $("ssFilmstrip").querySelector(".ss-film.active")?.scrollIntoView({
+    behavior: "smooth",
+    inline: "center",
+    block: "nearest",
+  });
   const n = ss.items.length;
   $("ssCounter").textContent = `${ss.idx + 1} / ${n}`;
   $("ssProgressPos").style.width = (n > 1 ? (ss.idx / (n - 1)) * 100 : 0) + "%";
@@ -956,7 +954,12 @@ function ssNav(dir) {
 function ssPlay() {
   ss.playing = true;
   $("ssPlayIcon").textContent = "pause";
-  if (ss.audio) ss.audio.play().catch(() => {});
+  if (ss.audio) {
+    ss.audio.play().catch((err) => {
+      showToast("⚠️ Click Play again to enable audio", "error");
+      console.error("Audio blocked:", err);
+    });
+  }
   ssStartAuto();
 }
 function ssPause() {
